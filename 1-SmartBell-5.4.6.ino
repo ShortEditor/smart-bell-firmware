@@ -1,0 +1,1803 @@
+/*
+  SmartBell 5.4.6 - SINGLE-FILE edition (persistent-storage recovery)
+  5.4.6 changes: LittleFS mount retry, cache save/restore diagnostics,
+  explicit FORMAT repair guidance. No auto-format; Firebase architecture,
+  relay timing, RTC and offline behaviour unchanged from 5.4.5.
+  Board: ESP32 Dev Module (classic ESP32)
+  Verified dependency versions: ESP32 core 2.0.17, ArduinoJson 6.21.5,
+  RTClib 2.1.4, Adafruit BusIO 1.17.4.
+
+  EDIT the four FB_SSID / FB_PASS values below before first upload.
+  Recovery: enter a real primary SSID/password below. WIFI_SETUP_REVISION
+  applies those credentials once, then website changes remain saved.
+  Increment WIFI_SETUP_REVISION for each later USB Wi-Fi recovery.
+  Use the existing SmartBell 5.4.4 website for selectable manual duration.
+  The 5.4 protocol remains compatible. Durations are whole seconds, 1-60.
+
+  Relay IN1: GPIO26, active LOW. RTC DS3231: SDA21, SCL22, 3V3, GND.
+  Retains existing saved networks, timetable cache and ring receipts.
+  Stays on a working secondary Wi-Fi; no forced five-minute primary retries.
+  Primary is tried on startup or after loss of the secondary connection.
+  Duration-only UI: manual, regular and exam all use whole seconds (1-60).
+  A pending pulse receipt after reboot is reported as UNCONFIRMED, never replayed.
+  Timing measures GPIO commands, not physical relay contacts or audible bell sound.
+  Brownout/watchdog protections stay enabled; resets cannot be fixed by a timer.
+  This file embeds the helper code and TLS certificates; no project .h files needed.
+*/
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+
+// ONE-TIME USB WI-FI RECOVERY:
+// Set FB_SSID1 and FB_PASS1 to your real 2.4GHz hotspot, then upload.
+// Revision 1 applies once. Increase to 2, 3, ... for later recovery uploads.
+// Leave the revision unchanged for normal use and website Wi-Fi changes.
+const int WIFI_SETUP_REVISION = 1;
+int appliedWiFiSetupRevision = 0;
+
+const String FB_SSID1 = "CollegeWiFi";        // College WiFi SSID
+const String FB_PASS1 = "college_password";    // College WiFi password
+const String FB_SSID2 = "MobileHotspot";       // Admin hotspot SSID
+const String FB_PASS2 = "hotspot_password";    // Admin hotspot password
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <esp_timer.h>
+#include <driver/gpio.h>
+#include <esp_system.h>
+#include <esp_sntp.h>
+#include <atomic>
+#include <string>
+#include <cstdint>
+namespace guard {
+inline bool newSlot(const std::string& slot,const std::string& last);
+inline bool fresh(uint64_t issued,uint64_t expires,uint64_t now);
+inline bool newCommand(const std::string& id,const std::string& last,uint64_t issued,uint64_t lastIssued);
+// Lexicographic ISO date/minute key also blocks replay after clock rollback.
+inline bool newSlot(const std::string& slot,const std::string& last) {
+  return slot.size()==16 && (last.empty() || slot>last);
+}
+inline bool fresh(uint64_t issued,uint64_t expires,uint64_t now) {
+  return now>=1700000000000ULL && issued>=1700000000000ULL && issued<=now+30000ULL &&
+    expires>now && expires>issued && expires-issued<=180000ULL;
+}
+inline bool newCommand(const std::string& id,const std::string& last,uint64_t issued,uint64_t lastIssued) {
+  return id.size()>=8 && id.size()<=64 && id!=last && issued>lastIssued;
+}
+}
+
+// Google public trust roots, retrieved 2026-09-23 from https://pki.goog/roots.pem
+static const char TRUST_ROOTS[] PROGMEM = R"CERT(# Operating CA: Google Trust Services LLC
+# Subject: C = US, O = Google Trust Services LLC, CN = GTS Root R1
+# Issuer: C = US, O = Google Trust Services LLC, CN = GTS Root R1
+# Label: "GTS Root R1"
+# Serial: 0203E5936F31B01349886BA217
+# MD5 Fingerprint: 05:FE:D0:BF:71:A8:A3:76:63:DA:01:E0:D8:52:DC:40
+# SHA1 Fingerprint: E5:8C:1C:C4:91:3B:38:63:4B:E9:10:6E:E3:AD:8E:6B:9D:D9:81:4A
+# SHA256 Fingerprint: D9:47:43:2A:BD:E7:B7:FA:90:FC:2E:6B:59:10:1B:12:80:E0:E1:C7:E4:E4:0F:A3:C6:88:7F:FF:57:A7:F4:CF
+-----BEGIN CERTIFICATE-----
+MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw
+CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU
+MBIGA1UEAxMLR1RTIFJvb3QgUjEwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAw
+MDAwWjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZp
+Y2VzIExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjEwggIiMA0GCSqGSIb3DQEBAQUA
+A4ICDwAwggIKAoICAQC2EQKLHuOhd5s73L+UPreVp0A8of2C+X0yBoJx9vaMf/vo
+27xqLpeXo4xL+Sv2sfnOhB2x+cWX3u+58qPpvBKJXqeqUqv4IyfLpLGcY9vXmX7w
+Cl7raKb0xlpHDU0QM+NOsROjyBhsS+z8CZDfnWQpJSMHobTSPS5g4M/SCYe7zUjw
+TcLCeoiKu7rPWRnWr4+wB7CeMfGCwcDfLqZtbBkOtdh+JhpFAz2weaSUKK0Pfybl
+qAj+lug8aJRT7oM6iCsVlgmy4HqMLnXWnOunVmSPlk9orj2XwoSPwLxAwAtcvfaH
+szVsrBhQf4TgTM2S0yDpM7xSma8ytSmzJSq0SPly4cpk9+aCEI3oncKKiPo4Zor8
+Y/kB+Xj9e1x3+naH+uzfsQ55lVe0vSbv1gHR6xYKu44LtcXFilWr06zqkUspzBmk
+MiVOKvFlRNACzqrOSbTqn3yDsEB750Orp2yjj32JgfpMpf/VjsPOS+C12LOORc92
+wO1AK/1TD7Cn1TsNsYqiA94xrcx36m97PtbfkSIS5r762DL8EGMUUXLeXdYWk70p
+aDPvOmbsB4om3xPXV2V4J95eSRQAogB/mqghtqmxlbCluQ0WEdrHbEg8QOB+DVrN
+VjzRlwW5y0vtOUucxD/SVRNuJLDWcfr0wbrM7Rv1/oFB2ACYPTrIrnqYNxgFlQID
+AQABo0IwQDAOBgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4E
+FgQU5K8rJnEaK0gnhS9SZizv8IkTcT4wDQYJKoZIhvcNAQEMBQADggIBAJ+qQibb
+C5u+/x6Wki4+omVKapi6Ist9wTrYggoGxval3sBOh2Z5ofmmWJyq+bXmYOfg6LEe
+QkEzCzc9zolwFcq1JKjPa7XSQCGYzyI0zzvFIoTgxQ6KfF2I5DUkzps+GlQebtuy
+h6f88/qBVRRiClmpIgUxPoLW7ttXNLwzldMXG+gnoot7TiYaelpkttGsN/H9oPM4
+7HLwEXWdyzRSjeZ2axfG34arJ45JK3VmgRAhpuo+9K4l/3wV3s6MJT/KYnAK9y8J
+ZgfIPxz88NtFMN9iiMG1D53Dn0reWVlHxYciNuaCp+0KueIHoI17eko8cdLiA6Ef
+MgfdG+RCzgwARWGAtQsgWSl4vflVy2PFPEz0tv/bal8xa5meLMFrUKTX5hgUvYU/
+Z6tGn6D/Qqc6f1zLXbBwHSs09dR2CQzreExZBfMzQsNhFRAbd03OIozUhfJFfbdT
+6u9AWpQKXCBfTkBdYiJ23//OYb2MI3jSNwLgjt7RETeJ9r/tSQdirpLsQBqvFAnZ
+0E6yove+7u7Y/9waLd64NnHi/Hm3lCXRSHNboTXns5lndcEZOitHTtNCjv0xyBZm
+2tIMPNuzjsmhDYAPexZ3FL//2wmUspO8IFgV6dtxQ/PeEMMA3KgqlbbC1j+Qa3bb
+bP6MvPJwNQzcmRk13NfIRmPVNnGuV/u3gm3c
+-----END CERTIFICATE-----
+
+# Operating CA: Google Trust Services LLC
+# Subject: C = US, O = Google Trust Services LLC, CN = GTS Root R2
+# Issuer: C = US, O = Google Trust Services LLC, CN = GTS Root R2
+# Label: "GTS Root R2"
+# Serial: 0203E5AEC58D04251AAB1125AA
+# MD5 Fingerprint=1E:39:C0:53:E6:1E:29:82:0B:CA:52:55:36:5D:57:DC
+# SHA1 Fingerprint=9A:44:49:76:32:DB:DE:FA:D0:BC:FB:5A:7B:17:BD:9E:56:09:24:94
+# SHA256 Fingerprint=8D:25:CD:97:22:9D:BF:70:35:6B:DA:4E:B3:CC:73:40:31:E2:4C:F0:0F:AF:CF:D3:2D:C7:6E:B5:84:1C:7E:A8
+-----BEGIN CERTIFICATE-----
+MIIFVzCCAz+gAwIBAgINAgPlrsWNBCUaqxElqjANBgkqhkiG9w0BAQwFADBHMQsw
+CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU
+MBIGA1UEAxMLR1RTIFJvb3QgUjIwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAw
+MDAwWjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZp
+Y2VzIExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjIwggIiMA0GCSqGSIb3DQEBAQUA
+A4ICDwAwggIKAoICAQDO3v2m++zsFDQ8BwZabFn3GTXd98GdVarTzTukk3LvCvpt
+nfbwhYBboUhSnznFt+4orO/LdmgUud+tAWyZH8QiHZ/+cnfgLFuv5AS/T3KgGjSY
+6Dlo7JUle3ah5mm5hRm9iYz+re026nO8/4Piy33B0s5Ks40FnotJk9/BW9BuXvAu
+MC6C/Pq8tBcKSOWIm8Wba96wyrQD8Nr0kLhlZPdcTK3ofmZemde4wj7I0BOdre7k
+RXuJVfeKH2JShBKzwkCX44ofR5GmdFrS+LFjKBC4swm4VndAoiaYecb+3yXuPuWg
+f9RhD1FLPD+M2uFwdNjCaKH5wQzpoeJ/u1U8dgbuak7MkogwTZq9TwtImoS1mKPV
++3PBV2HdKFZ1E66HjucMUQkQdYhMvI35ezzUIkgfKtzra7tEscszcTJGr61K8Yzo
+dDqs5xoic4DSMPclQsciOzsSrZYuxsN2B6ogtzVJV+mSSeh2FnIxZyuWfoqjx5RW
+Ir9qS34BIbIjMt/kmkRtWVtd9QCgHJvGeJeNkP+byKq0rxFROV7Z+2et1VsRnTKa
+G73VululycslaVNVJ1zgyjbLiGH7HrfQy+4W+9OmTN6SpdTi3/UGVN4unUu0kzCq
+gc7dGtxRcw1PcOnlthYhGXmy5okLdWTK1au8CcEYof/UVKGFPP0UJAOyh9OktwID
+AQABo0IwQDAOBgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4E
+FgQUu//KjiOfT5nK2+JopqUVJxce2Q4wDQYJKoZIhvcNAQEMBQADggIBAB/Kzt3H
+vqGf2SdMC9wXmBFqiN495nFWcrKeGk6c1SuYJF2ba3uwM4IJvd8lRuqYnrYb/oM8
+0mJhwQTtzuDFycgTE1XnqGOtjHsB/ncw4c5omwX4Eu55MaBBRTUoCnGkJE+M3DyC
+B19m3H0Q/gxhswWV7uGugQ+o+MePTagjAiZrHYNSVc61LwDKgEDg4XSsYPWHgJ2u
+NmSRXbBoGOqKYcl3qJfEycel/FVL8/B/uWU9J2jQzGv6U53hkRrJXRqWbTKH7QMg
+yALOWr7Z6v2yTcQvG99fevX4i8buMTolUVVnjWQye+mew4K6Ki3pHrTgSAai/Gev
+HyICc/sgCq+dVEuhzf9gR7A/Xe8bVr2XIZYtCtFenTgCR2y59PYjJbigapordwj6
+xLEokCZYCDzifqrXPW+6MYgKBesntaFJ7qBFVHvmJ2WZICGoo7z7GJa7Um8M7YNR
+TOlZ4iBgxcJlkoKM8xAfDoqXvneCbT+PHV28SSe9zE8P4c52hgQjxcCMElv924Sg
+JPFI/2R80L5cFtHvma3AH/vLrrw4IgYmZNralw4/KBVEqE8AyvCazM90arQ+POuV
+7LXTWtiBmelDGDfrs7vRWGJB82bSj6p4lVQgw1oudCvV0b4YacCs1aTPObpRhANl
+6WLAYv7YTVWW4tAR+kg0Eeye7QUd5MjWHYbL
+-----END CERTIFICATE-----
+
+# Operating CA: Google Trust Services LLC
+# Subject: C = US, O = Google Trust Services LLC, CN = GTS Root R3
+# Issuer: C = US, O = Google Trust Services LLC, CN = GTS Root R3
+# Label: "GTS Root R3"
+# Serial: 0203E5B882EB20F825276D3D66
+# MD5 Fingerprint: 3E:E7:9D:58:02:94:46:51:94:E5:E0:22:4A:8B:E7:73
+# SHA1 Fingerprint: ED:E5:71:80:2B:C8:92:B9:5B:83:3C:D2:32:68:3F:09:CD:A0:1E:46
+# SHA256 Fingerprint: 34:D8:A7:3E:E2:08:D9:BC:DB:0D:95:65:20:93:4B:4E:40:E6:94:82:59:6E:8B:6F:73:C8:42:6B:01:0A:6F:48
+-----BEGIN CERTIFICATE-----
+MIICCTCCAY6gAwIBAgINAgPluILrIPglJ209ZjAKBggqhkjOPQQDAzBHMQswCQYD
+VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG
+A1UEAxMLR1RTIFJvb3QgUjMwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw
+WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz
+IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjMwdjAQBgcqhkjOPQIBBgUrgQQAIgNi
+AAQfTzOHMymKoYTey8chWEGJ6ladK0uFxh1MJ7x/JlFyb+Kf1qPKzEUURout736G
+jOyxfi//qXGdGIRFBEFVbivqJn+7kAHjSxm65FSWRQmx1WyRRK2EE46ajA2ADDL2
+4CejQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW
+BBTB8Sa6oC2uhYHP0/EqEr24Cmf9vDAKBggqhkjOPQQDAwNpADBmAjEA9uEglRR7
+VKOQFhG/hMjqb2sXnh5GmCCbn9MN2azTL818+FsuVbu/3ZL3pAzcMeGiAjEA/Jdm
+ZuVDFhOD3cffL74UOO0BzrEXGhF16b0DjyZ+hOXJYKaV11RZt+cRLInUue4X
+-----END CERTIFICATE-----
+
+# Operating CA: Google Trust Services LLC
+# Subject: C = US, O = Google Trust Services LLC, CN = GTS Root R4
+# Issuer: C = US, O = Google Trust Services LLC, CN = GTS Root R4
+# Label: "GTS Root R4"
+# Serial: 0203E5C068EF631A9C72905052
+# MD5 Fingerprint=43:96:83:77:19:4D:76:B3:9D:65:52:E4:1D:22:A5:E8
+# SHA1 Fingerprint=77:D3:03:67:B5:E0:0C:15:F6:0C:38:61:DF:7C:E1:3B:92:46:4D:47
+# SHA256 Fingerprint=34:9D:FA:40:58:C5:E2:63:12:3B:39:8A:E7:95:57:3C:4E:13:13:C8:3F:E6:8F:93:55:6C:D5:E8:03:1B:3C:7D
+-----BEGIN CERTIFICATE-----
+MIICCTCCAY6gAwIBAgINAgPlwGjvYxqccpBQUjAKBggqhkjOPQQDAzBHMQswCQYD
+VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG
+A1UEAxMLR1RTIFJvb3QgUjQwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw
+WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz
+IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjQwdjAQBgcqhkjOPQIBBgUrgQQAIgNi
+AATzdHOnaItgrkO4NcWBMHtLSZ37wWHO5t5GvWvVYRg1rkDdc/eJkTBa6zzuhXyi
+QHY7qca4R9gq55KRanPpsXI5nymfopjTX15YhmUPoYRlBtHci8nHc8iMai/lxKvR
+HYqjQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW
+BBSATNbrdP9JNqPV2Py1PsVq8JQdjDAKBggqhkjOPQQDAwNpADBmAjEA6ED/g94D
+9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8
+p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD
+-----END CERTIFICATE-----
+
+# Operating CA: Google Trust Services LLC
+# Subject: OU = GlobalSign ECC Root CA - R4, O = GlobalSign, CN = GlobalSign
+# Issuer: OU = GlobalSign ECC Root CA - R4, O = GlobalSign, CN = GlobalSign
+# Label: "GlobalSign R4"
+# Serial: 0203E57EF53F93FDA50921B2A6
+# MD5 Fingerprint: 26:29:F8:6D:E1:88:BF:A2:65:7F:AA:C4:CD:0F:7F:FC
+# SHA1 Fingerprint: 6B:A0:B0:98:E1:71:EF:5A:AD:FE:48:15:80:77:10:F4:BD:6F:0B:28
+# SHA256 Fingerprint: B0:85:D7:0B:96:4F:19:1A:73:E4:AF:0D:54:AE:7A:0E:07:AA:FD:AF:9B:71:DD:08:62:13:8A:B7:32:5A:24:A2
+-----BEGIN CERTIFICATE-----
+MIIB3DCCAYOgAwIBAgINAgPlfvU/k/2lCSGypjAKBggqhkjOPQQDAjBQMSQwIgYD
+VQQLExtHbG9iYWxTaWduIEVDQyBSb290IENBIC0gUjQxEzARBgNVBAoTCkdsb2Jh
+bFNpZ24xEzARBgNVBAMTCkdsb2JhbFNpZ24wHhcNMTIxMTEzMDAwMDAwWhcNMzgw
+MTE5MDMxNDA3WjBQMSQwIgYDVQQLExtHbG9iYWxTaWduIEVDQyBSb290IENBIC0g
+UjQxEzARBgNVBAoTCkdsb2JhbFNpZ24xEzARBgNVBAMTCkdsb2JhbFNpZ24wWTAT
+BgcqhkjOPQIBBggqhkjOPQMBBwNCAAS4xnnTj2wlDp8uORkcA6SumuU5BwkWymOx
+uYb4ilfBV85C+nOh92VC/x7BALJucw7/xyHlGKSq2XE/qNS5zowdo0IwQDAOBgNV
+HQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUVLB7rUW44kB/
++wpu+74zyTyjhNUwCgYIKoZIzj0EAwIDRwAwRAIgIk90crlgr/HmnKAWBVBfw147
+bmF0774BxL4YSFlhgjICICadVGNA3jdgUM/I2O2dgq43mLyjj0xMqTQrbO/7lZsm
+-----END CERTIFICATE-----
+
+# Operating CA: DigiCert
+# Issuer: CN=DigiCert Assured ID Root G2 O=DigiCert Inc OU=www.digicert.com
+# Subject: CN=DigiCert Assured ID Root G2 O=DigiCert Inc OU=www.digicert.com
+# Label: "DigiCert Assured ID Root G2"
+# Serial: 15385348160840213938643033620894905419
+# MD5 Fingerprint: 92:38:b9:f8:63:24:82:65:2c:57:33:e6:fe:81:8f:9d
+# SHA1 Fingerprint: a1:4b:48:d9:43:ee:0a:0e:40:90:4f:3c:e0:a4:c0:91:93:51:5d:3f
+# SHA256 Fingerprint: 7d:05:eb:b6:82:33:9f:8c:94:51:ee:09:4e:eb:fe:fa:79:53:a1:14:ed:b2:f4:49:49:45:2f:ab:7d:2f:c1:85
+-----BEGIN CERTIFICATE-----
+MIIDljCCAn6gAwIBAgIQC5McOtY5Z+pnI7/Dr5r0SzANBgkqhkiG9w0BAQsFADBl
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSQwIgYDVQQDExtEaWdpQ2VydCBBc3N1cmVkIElEIFJv
+b3QgRzIwHhcNMTMwODAxMTIwMDAwWhcNMzgwMTE1MTIwMDAwWjBlMQswCQYDVQQG
+EwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3d3cuZGlnaWNl
+cnQuY29tMSQwIgYDVQQDExtEaWdpQ2VydCBBc3N1cmVkIElEIFJvb3QgRzIwggEi
+MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDZ5ygvUj82ckmIkzTz+GoeMVSA
+n61UQbVH35ao1K+ALbkKz3X9iaV9JPrjIgwrvJUXCzO/GU1BBpAAvQxNEP4Htecc
+biJVMWWXvdMX0h5i89vqbFCMP4QMls+3ywPgym2hFEwbid3tALBSfK+RbLE4E9Hp
+EgjAALAcKxHad3A2m67OeYfcgnDmCXRwVWmvo2ifv922ebPynXApVfSr/5Vh88lA
+bx3RvpO704gqu52/clpWcTs/1PPRCv4o76Pu2ZmvA9OPYLfykqGxvYmJHzDNw6Yu
+YjOuFgJ3RFrngQo8p0Quebg/BLxcoIfhG69Rjs3sLPr4/m3wOnyqi+RnlTGNAgMB
+AAGjQjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgGGMB0GA1UdDgQW
+BBTOw0q5mVXyuNtgv6l+vVa1lzan1jANBgkqhkiG9w0BAQsFAAOCAQEAyqVVjOPI
+QW5pJ6d1Ee88hjZv0p3GeDgdaZaikmkuOGybfQTUiaWxMTeKySHMq2zNixya1r9I
+0jJmwYrA8y8678Dj1JGG0VDjA9tzd29KOVPt3ibHtX2vK0LRdWLjSisCx1BL4Gni
+lmwORGYQRI+tBev4eaymG+g3NJ1TyWGqolKvSnAWhsI6yLETcDbYz+70CjTVW0z9
+B5yiutkBclzzTcHdDrEcDcRjvq30FPuJ7KJBDkzMyFdA0G4Dqs0MjomZmWzwPDCv
+ON9vvKO+KSAnq3T/EyJ43pdSVR6DtVQgA+6uwE9W3jfMw3+qBCe703e4YtsXfJwo
+IhNzbM8m9Yop5w==
+-----END CERTIFICATE-----
+
+# Operating CA: DigiCert
+# Issuer: CN=DigiCert Assured ID Root G3 O=DigiCert Inc OU=www.digicert.com
+# Subject: CN=DigiCert Assured ID Root G3 O=DigiCert Inc OU=www.digicert.com
+# Label: "DigiCert Assured ID Root G3"
+# Serial: 15459312981008553731928384953135426796
+# MD5 Fingerprint: 7c:7f:65:31:0c:81:df:8d:ba:3e:99:e2:5c:ad:6e:fb
+# SHA1 Fingerprint: f5:17:a2:4f:9a:48:c6:c9:f8:a2:00:26:9f:dc:0f:48:2c:ab:30:89
+# SHA256 Fingerprint: 7e:37:cb:8b:4c:47:09:0c:ab:36:55:1b:a6:f4:5d:b8:40:68:0f:ba:16:6a:95:2d:b1:00:71:7f:43:05:3f:c2
+-----BEGIN CERTIFICATE-----
+MIICRjCCAc2gAwIBAgIQC6Fa+h3foLVJRK/NJKBs7DAKBggqhkjOPQQDAzBlMQsw
+CQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3d3cu
+ZGlnaWNlcnQuY29tMSQwIgYDVQQDExtEaWdpQ2VydCBBc3N1cmVkIElEIFJvb3Qg
+RzMwHhcNMTMwODAxMTIwMDAwWhcNMzgwMTE1MTIwMDAwWjBlMQswCQYDVQQGEwJV
+UzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3d3cuZGlnaWNlcnQu
+Y29tMSQwIgYDVQQDExtEaWdpQ2VydCBBc3N1cmVkIElEIFJvb3QgRzMwdjAQBgcq
+hkjOPQIBBgUrgQQAIgNiAAQZ57ysRGXtzbg/WPuNsVepRC0FFfLvC/8QdJ+1YlJf
+Zn4f5dwbRXkLzMZTCp2NXQLZqVneAlr2lSoOjThKiknGvMYDOAdfVdp+CW7if17Q
+RSAPWXYQ1qAk8C3eNvJsKTmjQjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/
+BAQDAgGGMB0GA1UdDgQWBBTL0L2p4ZgFUaFNN6KDec6NHSrkhDAKBggqhkjOPQQD
+AwNnADBkAjAlpIFFAmsSS3V0T8gj43DydXLefInwz5FyYZ5eEJJZVrmDxxDnOOlY
+JjZ91eQ0hjkCMHw2U/Aw5WJjOpnitqM7mzT6HtoQknFekROn3aRukswy1vUhZscv
+6pZjamVFkpUBtA==
+-----END CERTIFICATE-----
+
+
+# Operating CA: DigiCert
+# Issuer: CN=DigiCert Global Root G2 O=DigiCert Inc OU=www.digicert.com
+# Subject: CN=DigiCert Global Root G2 O=DigiCert Inc OU=www.digicert.com
+# Label: "DigiCert Global Root G2"
+# Serial: 4293743540046975378534879503202253541
+# MD5 Fingerprint: e4:a6:8a:c8:54:ac:52:42:46:0a:fd:72:48:1b:2a:44
+# SHA1 Fingerprint: df:3c:24:f9:bf:d6:66:76:1b:26:80:73:fe:06:d1:cc:8d:4f:82:a4
+# SHA256 Fingerprint: cb:3c:cb:b7:60:31:e5:e0:13:8f:8d:d3:9a:23:f9:de:47:ff:c3:5e:43:c1:14:4c:ea:27:d4:6a:5a:b1:cb:5f
+-----BEGIN CERTIFICATE-----
+MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBH
+MjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVT
+MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j
+b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI
+2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx
+1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ
+q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz
+tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ
+vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo0IwQDAP
+BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUTiJUIBiV
+5uNu5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY
+1Yl9PMWLSn/pvtsrF9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4
+NeF22d+mQrvHRAiGfzZ0JFrabA0UWTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NG
+Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91
+8rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/iyK5S9kJRaTe
+pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl
+MrY=
+-----END CERTIFICATE-----
+
+# Operating CA: DigiCert
+# Issuer: CN=DigiCert Global Root G3 O=DigiCert Inc OU=www.digicert.com
+# Subject: CN=DigiCert Global Root G3 O=DigiCert Inc OU=www.digicert.com
+# Label: "DigiCert Global Root G3"
+# Serial: 7089244469030293291760083333884364146
+# MD5 Fingerprint: f5:5d:a4:50:a5:fb:28:7e:1e:0f:0d:cc:96:57:56:ca
+# SHA1 Fingerprint: 7e:04:de:89:6a:3e:66:6d:00:e6:87:d3:3f:fa:d9:3b:e8:3d:34:9e
+# SHA256 Fingerprint: 31:ad:66:48:f8:10:41:38:c7:38:f3:9e:a4:32:01:33:39:3e:3a:18:cc:02:29:6e:f9:7c:2a:c9:ef:67:31:d0
+-----BEGIN CERTIFICATE-----
+MIICPzCCAcWgAwIBAgIQBVVWvPJepDU1w6QP1atFcjAKBggqhkjOPQQDAzBhMQsw
+CQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3d3cu
+ZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBHMzAe
+Fw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVTMRUw
+EwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20x
+IDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEczMHYwEAYHKoZIzj0CAQYF
+K4EEACIDYgAE3afZu4q4C/sLfyHS8L6+c/MzXRq8NOrexpu80JX28MzQC7phW1FG
+fp4tn+6OYwwX7Adw9c+ELkCDnOg/QW07rdOkFFk2eJ0DQ+4QE2xy3q6Ip6FrtUPO
+Z9wj/wMco+I+o0IwQDAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAd
+BgNVHQ4EFgQUs9tIpPmhxdiuNkHMEWNpYim8S8YwCgYIKoZIzj0EAwMDaAAwZQIx
+AK288mw/EkrRLTnDCgmXc/SINoyIJ7vmiI1Qhadj+Z4y3maTD/HMsQmP3Wyr+mt/
+oAIwOWZbwmSNuJ5Q3KjVSaLtx9zRSX8XAbjIho9OjIgrqJqpisXRAL34VOKa5Vt8
+sycX
+-----END CERTIFICATE-----
+
+
+# Operating CA: DigiCert
+# Issuer: CN=DigiCert Trusted Root G4 O=DigiCert Inc OU=www.digicert.com
+# Subject: CN=DigiCert Trusted Root G4 O=DigiCert Inc OU=www.digicert.com
+# Label: "DigiCert Trusted Root G4"
+# Serial: 7451500558977370777930084869016614236
+# MD5 Fingerprint: 78:f2:fc:aa:60:1f:2f:b4:eb:c9:37:ba:53:2e:75:49
+# SHA1 Fingerprint: dd:fb:16:cd:49:31:c9:73:a2:03:7d:3f:c8:3a:4d:7d:77:5d:05:e4
+# SHA256 Fingerprint: 55:2f:7b:dc:f1:a7:af:9e:6c:e6:72:01:7f:4f:12:ab:f7:72:40:c7:8e:76:1a:c2:03:d1:d9:d2:0a:c8:99:88
+-----BEGIN CERTIFICATE-----
+MIIFkDCCA3igAwIBAgIQBZsbV56OITLiOQe9p3d1XDANBgkqhkiG9w0BAQwFADBi
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSEwHwYDVQQDExhEaWdpQ2VydCBUcnVzdGVkIFJvb3Qg
+RzQwHhcNMTMwODAxMTIwMDAwWhcNMzgwMTE1MTIwMDAwWjBiMQswCQYDVQQGEwJV
+UzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3d3cuZGlnaWNlcnQu
+Y29tMSEwHwYDVQQDExhEaWdpQ2VydCBUcnVzdGVkIFJvb3QgRzQwggIiMA0GCSqG
+SIb3DQEBAQUAA4ICDwAwggIKAoICAQC/5pBzaN675F1KPDAiMGkz7MKnJS7JIT3y
+ithZwuEppz1Yq3aaza57G4QNxDAf8xukOBbrVsaXbR2rsnnyyhHS5F/WBTxSD1If
+xp4VpX6+n6lXFllVcq9ok3DCsrp1mWpzMpTREEQQLt+C8weE5nQ7bXHiLQwb7iDV
+ySAdYyktzuxeTsiT+CFhmzTrBcZe7FsavOvJz82sNEBfsXpm7nfISKhmV1efVFiO
+DCu3T6cw2Vbuyntd463JT17lNecxy9qTXtyOj4DatpGYQJB5w3jHtrHEtWoYOAMQ
+jdjUN6QuBX2I9YI+EJFwq1WCQTLX2wRzKm6RAXwhTNS8rhsDdV14Ztk6MUSaM0C/
+CNdaSaTC5qmgZ92kJ7yhTzm1EVgX9yRcRo9k98FpiHaYdj1ZXUJ2h4mXaXpI8OCi
+EhtmmnTK3kse5w5jrubU75KSOp493ADkRSWJtppEGSt+wJS00mFt6zPZxd9LBADM
+fRyVw4/3IbKyEbe7f/LVjHAsQWCqsWMYRJUadmJ+9oCw++hkpjPRiQfhvbfmQ6QY
+uKZ3AeEPlAwhHbJUKSWJbOUOUlFHdL4mrLZBdd56rF+NP8m800ERElvlEFDrMcXK
+chYiCd98THU/Y+whX8QgUWtvsauGi0/C1kVfnSD8oR7FwI+isX4KJpn15GkvmB0t
+9dmpsh3lGwIDAQABo0IwQDAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIB
+hjAdBgNVHQ4EFgQU7NfjgtJxXWRM3y5nP+e6mK4cD08wDQYJKoZIhvcNAQEMBQAD
+ggIBALth2X2pbL4XxJEbw6GiAI3jZGgPVs93rnD5/ZpKmbnJeFwMDF/k5hQpVgs2
+SV1EY+CtnJYYZhsjDT156W1r1lT40jzBQ0CuHVD1UvyQO7uYmWlrx8GnqGikJ9yd
++SeuMIW59mdNOj6PWTkiU0TryF0Dyu1Qen1iIQqAyHNm0aAFYF/opbSnr6j3bTWc
+fFqK1qI4mfN4i/RN0iAL3gTujJtHgXINwBQy7zBZLq7gcfJW5GqXb5JQbZaNaHqa
+sjYUegbyJLkJEVDXCLG4iXqEI2FCKeWjzaIgQdfRnGTZ6iahixTXTBmyUEFxPT9N
+cCOGDErcgdLMMpSEDQgJlxxPwO5rIHQw0uA5NBCFIRUBCOhVMt5xSdkoF1BN5r5N
+0XWs0Mr7QbhDparTwwVETyw2m+L64kW4I1NsBm9nVX9GtUw/bihaeSbSpKhil9Ie
+4u1Ki7wb/UdKDd9nZn6yW0HQO+T0O/QEY+nvwlQAUaCKKsnOeMzV6ocEGLPOr0mI
+r/OSmbaz5mEP0oUA51Aa5BuVnRmhuZyxm7EAHu/QD09CbMkKvO5D+jpxpchNJqU1
+/YldvIViHTLSoCtU7ZpXwdv6EM8Zt4tKG48BtieVU+i2iW1bvGjUI+iLUaJW+fCm
+gKDWHrO8Dw9TdSmq6hN35N6MgSGtBxBHEa2HPQfRdbzP82Z+
+-----END CERTIFICATE-----
+
+# Operating CA: GlobalSign
+# Issuer: CN=GlobalSign O=GlobalSign OU=GlobalSign Root CA - R3
+# Subject: CN=GlobalSign O=GlobalSign OU=GlobalSign Root CA - R3
+# Label: "GlobalSign Root CA - R3"
+# Serial: 4835703278459759426209954
+# MD5 Fingerprint: c5:df:b8:49:ca:05:13:55:ee:2d:ba:1a:c3:3e:b0:28
+# SHA1 Fingerprint: d6:9b:56:11:48:f0:1c:77:c5:45:78:c1:09:26:df:5b:85:69:76:ad
+# SHA256 Fingerprint: cb:b5:22:d7:b7:f1:27:ad:6a:01:13:86:5b:df:1c:d4:10:2e:7d:07:59:af:63:5a:7c:f4:72:0d:c9:63:c5:3b
+-----BEGIN CERTIFICATE-----
+MIIDXzCCAkegAwIBAgILBAAAAAABIVhTCKIwDQYJKoZIhvcNAQELBQAwTDEgMB4G
+A1UECxMXR2xvYmFsU2lnbiBSb290IENBIC0gUjMxEzARBgNVBAoTCkdsb2JhbFNp
+Z24xEzARBgNVBAMTCkdsb2JhbFNpZ24wHhcNMDkwMzE4MTAwMDAwWhcNMjkwMzE4
+MTAwMDAwWjBMMSAwHgYDVQQLExdHbG9iYWxTaWduIFJvb3QgQ0EgLSBSMzETMBEG
+A1UEChMKR2xvYmFsU2lnbjETMBEGA1UEAxMKR2xvYmFsU2lnbjCCASIwDQYJKoZI
+hvcNAQEBBQADggEPADCCAQoCggEBAMwldpB5BngiFvXAg7aEyiie/QV2EcWtiHL8
+RgJDx7KKnQRfJMsuS+FggkbhUqsMgUdwbN1k0ev1LKMPgj0MK66X17YUhhB5uzsT
+gHeMCOFJ0mpiLx9e+pZo34knlTifBtc+ycsmWQ1z3rDI6SYOgxXG71uL0gRgykmm
+KPZpO/bLyCiR5Z2KYVc3rHQU3HTgOu5yLy6c+9C7v/U9AOEGM+iCK65TpjoWc4zd
+QQ4gOsC0p6Hpsk+QLjJg6VfLuQSSaGjlOCZgdbKfd/+RFO+uIEn8rUAVSNECMWEZ
+XriX7613t2Saer9fwRPvm2L7DWzgVGkWqQPabumDk3F2xmmFghcCAwEAAaNCMEAw
+DgYDVR0PAQH/BAQDAgEGMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFI/wS3+o
+LkUkrk1Q+mOai97i3Ru8MA0GCSqGSIb3DQEBCwUAA4IBAQBLQNvAUKr+yAzv95ZU
+RUm7lgAJQayzE4aGKAczymvmdLm6AC2upArT9fHxD4q/c2dKg8dEe3jgr25sbwMp
+jjM5RcOO5LlXbKr8EpbsU8Yt5CRsuZRj+9xTaGdWPoO4zzUhw8lo/s7awlOqzJCK
+6fBdRoyV3XpYKBovHd7NADdBj+1EbddTKJd+82cEHhXXipa0095MJ6RMG3NzdvQX
+mcIfeg7jLQitChws/zyrVQ4PkX4268NXSb7hLi18YIvDQVETI53O9zJrlAGomecs
+Mx86OyXShkDOOyyGeMlhLxS67ttVb9+E7gUJTb0o2HLO02JQZR7rkpeDMdmztcpH
+WD9f
+-----END CERTIFICATE-----
+
+# Operating CA: GlobalSign
+# Issuer: CN=GlobalSign O=GlobalSign OU=GlobalSign ECC Root CA - R5
+# Subject: CN=GlobalSign O=GlobalSign OU=GlobalSign ECC Root CA - R5
+# Label: "GlobalSign ECC Root CA - R5"
+# Serial: 32785792099990507226680698011560947931244
+# MD5 Fingerprint: 9f:ad:3b:1c:02:1e:8a:ba:17:74:38:81:0c:a2:bc:08
+# SHA1 Fingerprint: 1f:24:c6:30:cd:a4:18:ef:20:69:ff:ad:4f:dd:5f:46:3a:1b:69:aa
+# SHA256 Fingerprint: 17:9f:bc:14:8a:3d:d0:0f:d2:4e:a1:34:58:cc:43:bf:a7:f5:9c:81:82:d7:83:a5:13:f6:eb:ec:10:0c:89:24
+-----BEGIN CERTIFICATE-----
+MIICHjCCAaSgAwIBAgIRYFlJ4CYuu1X5CneKcflK2GwwCgYIKoZIzj0EAwMwUDEk
+MCIGA1UECxMbR2xvYmFsU2lnbiBFQ0MgUm9vdCBDQSAtIFI1MRMwEQYDVQQKEwpH
+bG9iYWxTaWduMRMwEQYDVQQDEwpHbG9iYWxTaWduMB4XDTEyMTExMzAwMDAwMFoX
+DTM4MDExOTAzMTQwN1owUDEkMCIGA1UECxMbR2xvYmFsU2lnbiBFQ0MgUm9vdCBD
+QSAtIFI1MRMwEQYDVQQKEwpHbG9iYWxTaWduMRMwEQYDVQQDEwpHbG9iYWxTaWdu
+MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAER0UOlvt9Xb/pOdEh+J8LttV7HpI6SFkc
+8GIxLcB6KP4ap1yztsyX50XUWPrRd21DosCHZTQKH3rd6zwzocWdTaRvQZU4f8ke
+hOvRnkmSh5SHDDqFSmafnVmTTZdhBoZKo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYD
+VR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUPeYpSJvqB8ohREom3m7e0oPQn1kwCgYI
+KoZIzj0EAwMDaAAwZQIxAOVpEslu28YxuglB4Zf4+/2a4n0Sye18ZNPLBSWLVtmg
+515dTguDnFt2KaAJJiFqYgIwcdK1j1zqO+F4CYWodZI7yFz9SO8NdCKoCOJuxUnO
+xwy8p2Fp8fc74SrL+SvzZpA3
+-----END CERTIFICATE-----
+
+# Operating CA: GlobalSign
+# Issuer: CN=GlobalSign O=GlobalSign OU=GlobalSign Root CA - R6
+# Subject: CN=GlobalSign O=GlobalSign OU=GlobalSign Root CA - R6
+# Label: "GlobalSign Root CA - R6"
+# Serial: 1417766617973444989252670301619537
+# MD5 Fingerprint: 4f:dd:07:e4:d4:22:64:39:1e:0c:37:42:ea:d1:c6:ae
+# SHA1 Fingerprint: 80:94:64:0e:b5:a7:a1:ca:11:9c:1f:dd:d5:9f:81:02:63:a7:fb:d1
+# SHA256 Fingerprint: 2c:ab:ea:fe:37:d0:6c:a2:2a:ba:73:91:c0:03:3d:25:98:29:52:c4:53:64:73:49:76:3a:3a:b5:ad:6c:cf:69
+-----BEGIN CERTIFICATE-----
+MIIFgzCCA2ugAwIBAgIORea7A4Mzw4VlSOb/RVEwDQYJKoZIhvcNAQEMBQAwTDEg
+MB4GA1UECxMXR2xvYmFsU2lnbiBSb290IENBIC0gUjYxEzARBgNVBAoTCkdsb2Jh
+bFNpZ24xEzARBgNVBAMTCkdsb2JhbFNpZ24wHhcNMTQxMjEwMDAwMDAwWhcNMzQx
+MjEwMDAwMDAwWjBMMSAwHgYDVQQLExdHbG9iYWxTaWduIFJvb3QgQ0EgLSBSNjET
+MBEGA1UEChMKR2xvYmFsU2lnbjETMBEGA1UEAxMKR2xvYmFsU2lnbjCCAiIwDQYJ
+KoZIhvcNAQEBBQADggIPADCCAgoCggIBAJUH6HPKZvnsFMp7PPcNCPG0RQssgrRI
+xutbPK6DuEGSMxSkb3/pKszGsIhrxbaJ0cay/xTOURQh7ErdG1rG1ofuTToVBu1k
+ZguSgMpE3nOUTvOniX9PeGMIyBJQbUJmL025eShNUhqKGoC3GYEOfsSKvGRMIRxD
+aNc9PIrFsmbVkJq3MQbFvuJtMgamHvm566qjuL++gmNQ0PAYid/kD3n16qIfKtJw
+LnvnvJO7bVPiSHyMEAc4/2ayd2F+4OqMPKq0pPbzlUoSB239jLKJz9CgYXfIWHSw
+1CM69106yqLbnQneXUQtkPGBzVeS+n68UARjNN9rkxi+azayOeSsJDa38O+2HBNX
+k7besvjihbdzorg1qkXy4J02oW9UivFyVm4uiMVRQkQVlO6jxTiWm05OWgtH8wY2
+SXcwvHE35absIQh1/OZhFj931dmRl4QKbNQCTXTAFO39OfuD8l4UoQSwC+n+7o/h
+bguyCLNhZglqsQY6ZZZZwPA1/cnaKI0aEYdwgQqomnUdnjqGBQCe24DWJfncBZ4n
+WUx2OVvq+aWh2IMP0f/fMBH5hc8zSPXKbWQULHpYT9NLCEnFlWQaYw55PfWzjMpY
+rZxCRXluDocZXFSxZba/jJvcE+kNb7gu3GduyYsRtYQUigAZcIN5kZeR1Bonvzce
+MgfYFGM8KEyvAgMBAAGjYzBhMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMBAf8EBTAD
+AQH/MB0GA1UdDgQWBBSubAWjkxPioufi1xzWx/B/yGdToDAfBgNVHSMEGDAWgBSu
+bAWjkxPioufi1xzWx/B/yGdToDANBgkqhkiG9w0BAQwFAAOCAgEAgyXt6NH9lVLN
+nsAEoJFp5lzQhN7craJP6Ed41mWYqVuoPId8AorRbrcWc+ZfwFSY1XS+wc3iEZGt
+Ixg93eFyRJa0lV7Ae46ZeBZDE1ZXs6KzO7V33EByrKPrmzU+sQghoefEQzd5Mr61
+55wsTLxDKZmOMNOsIeDjHfrYBzN2VAAiKrlNIC5waNrlU/yDXNOd8v9EDERm8tLj
+vUYAGm0CuiVdjaExUd1URhxN25mW7xocBFymFe944Hn+Xds+qkxV/ZoVqW/hpvvf
+cDDpw+5CRu3CkwWJ+n1jez/QcYF8AOiYrg54NMMl+68KnyBr3TsTjxKM4kEaSHpz
+oHdpx7Zcf4LIHv5YGygrqGytXm3ABdJ7t+uA/iU3/gKbaKxCXcPu9czc8FB10jZp
+nOZ7BN9uBmm23goJSFmH63sUYHpkqmlD75HHTOwY3WzvUy2MmeFe8nI+z1TIvWfs
+pA9MRf/TuTAjB0yPEL+GltmZWrSZVxykzLsViVO6LAUP5MSeGbEYNNVMnbrt9x+v
+JJUEeKgDu+6B5dpffItKoZB0JaezPkvILFa9x8jvOOJckvB595yEunQtYQEgfn7R
+8k8HWV+LLUNS60YMlOH1Zkd5d9VUWx+tJDfLRVpOoERIyNiwmcUVhAn21klJwGW4
+5hpxbqCo8YLoRT5s1gLXCmeDBVrJpBA=
+-----END CERTIFICATE-----
+
+# Note: "GlobalSign Root CA - R7" not added on purpose. It is P-521.
+
+# Operating CA: GoDaddy
+# Issuer: CN=Go Daddy Root Certificate Authority - G2 O=GoDaddy.com, Inc.
+# Subject: CN=Go Daddy Root Certificate Authority - G2 O=GoDaddy.com, Inc.
+# Label: "Go Daddy Root Certificate Authority - G2"
+# Serial: 0
+# MD5 Fingerprint: 80:3a:bc:22:c1:e6:fb:8d:9b:3b:27:4a:32:1b:9a:01
+# SHA1 Fingerprint: 47:be:ab:c9:22:ea:e8:0e:78:78:34:62:a7:9f:45:c2:54:fd:e6:8b
+# SHA256 Fingerprint: 45:14:0b:32:47:eb:9c:c8:c5:b4:f0:d7:b5:30:91:f7:32:92:08:9e:6e:5a:63:e2:74:9d:d3:ac:a9:19:8e:da
+-----BEGIN CERTIFICATE-----
+MIIDxTCCAq2gAwIBAgIBADANBgkqhkiG9w0BAQsFADCBgzELMAkGA1UEBhMCVVMx
+EDAOBgNVBAgTB0FyaXpvbmExEzARBgNVBAcTClNjb3R0c2RhbGUxGjAYBgNVBAoT
+EUdvRGFkZHkuY29tLCBJbmMuMTEwLwYDVQQDEyhHbyBEYWRkeSBSb290IENlcnRp
+ZmljYXRlIEF1dGhvcml0eSAtIEcyMB4XDTA5MDkwMTAwMDAwMFoXDTM3MTIzMTIz
+NTk1OVowgYMxCzAJBgNVBAYTAlVTMRAwDgYDVQQIEwdBcml6b25hMRMwEQYDVQQH
+EwpTY290dHNkYWxlMRowGAYDVQQKExFHb0RhZGR5LmNvbSwgSW5jLjExMC8GA1UE
+AxMoR28gRGFkZHkgUm9vdCBDZXJ0aWZpY2F0ZSBBdXRob3JpdHkgLSBHMjCCASIw
+DQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAL9xYgjx+lk09xvJGKP3gElY6SKD
+E6bFIEMBO4Tx5oVJnyfq9oQbTqC023CYxzIBsQU+B07u9PpPL1kwIuerGVZr4oAH
+/PMWdYA5UXvl+TW2dE6pjYIT5LY/qQOD+qK+ihVqf94Lw7YZFAXK6sOoBJQ7Rnwy
+DfMAZiLIjWltNowRGLfTshxgtDj6AozO091GB94KPutdfMh8+7ArU6SSYmlRJQVh
+GkSBjCypQ5Yj36w6gZoOKcUcqeldHraenjAKOc7xiID7S13MMuyFYkMlNAJWJwGR
+tDtwKj9useiciAF9n9T521NtYJ2/LOdYq7hfRvzOxBsDPAnrSTFcaUaz4EcCAwEA
+AaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYE
+FDqahQcQZyi27/a9BUFuIMGU2g/eMA0GCSqGSIb3DQEBCwUAA4IBAQCZ21151fmX
+WWcDYfF+OwYxdS2hII5PZYe096acvNjpL9DbWu7PdIxztDhC2gV7+AJ1uP2lsdeu
+9tfeE8tTEH6KRtGX+rcuKxGrkLAngPnon1rpN5+r5N9ss4UXnT3ZJE95kTXWXwTr
+gIOrmgIttRD02JDHBHNA7XIloKmf7J6raBKZV8aPEjoJpL1E/QYVN8Gb5DKj7Tjo
+2GTzLH4U/ALqn83/B2gX2yKQOC16jdFU8WnjXzPKej17CuPKf1855eJ1usV2GDPO
+LPAvTK33sefOT6jEm0pUBsV/fdUID+Ic/n4XuKxe9tQWskMJDE32p2u0mYRlynqI
+4uJEvlz36hz1
+-----END CERTIFICATE-----
+
+# Operating CA: GoDaddy
+# Issuer: CN=Starfield Root Certificate Authority - G2 O=Starfield Technologies, Inc.
+# Subject: CN=Starfield Root Certificate Authority - G2 O=Starfield Technologies, Inc.
+# Label: "Starfield Root Certificate Authority - G2"
+# Serial: 0
+# MD5 Fingerprint: d6:39:81:c6:52:7e:96:69:fc:fc:ca:66:ed:05:f2:96
+# SHA1 Fingerprint: b5:1c:06:7c:ee:2b:0c:3d:f8:55:ab:2d:92:f4:fe:39:d4:e7:0f:0e
+# SHA256 Fingerprint: 2c:e1:cb:0b:f9:d2:f9:e1:02:99:3f:be:21:51:52:c3:b2:dd:0c:ab:de:1c:68:e5:31:9b:83:91:54:db:b7:f5
+-----BEGIN CERTIFICATE-----
+MIID3TCCAsWgAwIBAgIBADANBgkqhkiG9w0BAQsFADCBjzELMAkGA1UEBhMCVVMx
+EDAOBgNVBAgTB0FyaXpvbmExEzARBgNVBAcTClNjb3R0c2RhbGUxJTAjBgNVBAoT
+HFN0YXJmaWVsZCBUZWNobm9sb2dpZXMsIEluYy4xMjAwBgNVBAMTKVN0YXJmaWVs
+ZCBSb290IENlcnRpZmljYXRlIEF1dGhvcml0eSAtIEcyMB4XDTA5MDkwMTAwMDAw
+MFoXDTM3MTIzMTIzNTk1OVowgY8xCzAJBgNVBAYTAlVTMRAwDgYDVQQIEwdBcml6
+b25hMRMwEQYDVQQHEwpTY290dHNkYWxlMSUwIwYDVQQKExxTdGFyZmllbGQgVGVj
+aG5vbG9naWVzLCBJbmMuMTIwMAYDVQQDEylTdGFyZmllbGQgUm9vdCBDZXJ0aWZp
+Y2F0ZSBBdXRob3JpdHkgLSBHMjCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoC
+ggEBAL3twQP89o/8ArFvW59I2Z154qK3A2FWGMNHttfKPTUuiUP3oWmb3ooa/RMg
+nLRJdzIpVv257IzdIvpy3Cdhl+72WoTsbhm5iSzchFvVdPtrX8WJpRBSiUZV9Lh1
+HOZ/5FSuS/hVclcCGfgXcVnrHigHdMWdSL5stPSksPNkN3mSwOxGXn/hbVNMYq/N
+Hwtjuzqd+/x5AJhhdM8mgkBj87JyahkNmcrUDnXMN/uLicFZ8WJ/X7NfZTD4p7dN
+dloedl40wOiWVpmKs/B/pM293DIxfJHP4F8R+GuqSVzRmZTRouNjWwl2tVZi4Ut0
+HZbUJtQIBFnQmA4O5t78w+wfkPECAwEAAaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAO
+BgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFHwMMh+n2TB/xH1oo2Kooc6rB1snMA0G
+CSqGSIb3DQEBCwUAA4IBAQARWfolTwNvlJk7mh+ChTnUdgWUXuEok21iXQnCoKjU
+sHU48TRqneSfioYmUeYs0cYtbpUgSpIB7LiKZ3sx4mcujJUDJi5DnUox9g61DLu3
+4jd/IroAow57UvtruzvE03lRTs2Q9GcHGcg8RnoNAX3FWOdt5oUwF5okxBDgBPfg
+8n/Uqgr/Qh037ZTlZFkSIHc40zI+OIF1lnP6aI+xy84fxez6nH7PfrHxBy22/L/K
+pL/QlwVKvOoYKAKQvVR4CSFx09F9HdkWsKlhPdAKACL8x3vLCWRFCztAgfd9fDL1
+mMpYjn0q7pBZc2T5NnReJaH1ZgUufzkVqSr7UIuOhWn0
+-----END CERTIFICATE-----
+
+# Operating CA: Sectigo
+# Issuer: CN=COMODO ECC Certification Authority O=COMODO CA Limited
+# Subject: CN=COMODO ECC Certification Authority O=COMODO CA Limited
+# Label: "COMODO ECC Certification Authority"
+# Serial: 41578283867086692638256921589707938090
+# MD5 Fingerprint: 7c:62:ff:74:9d:31:53:5e:68:4a:d5:78:aa:1e:bf:23
+# SHA1 Fingerprint: 9f:74:4e:9f:2b:4d:ba:ec:0f:31:2c:50:b6:56:3b:8e:2d:93:c3:11
+# SHA256 Fingerprint: 17:93:92:7a:06:14:54:97:89:ad:ce:2f:8f:34:f7:f0:b6:6d:0f:3a:e3:a3:b8:4d:21:ec:15:db:ba:4f:ad:c7
+-----BEGIN CERTIFICATE-----
+MIICiTCCAg+gAwIBAgIQH0evqmIAcFBUTAGem2OZKjAKBggqhkjOPQQDAzCBhTEL
+MAkGA1UEBhMCR0IxGzAZBgNVBAgTEkdyZWF0ZXIgTWFuY2hlc3RlcjEQMA4GA1UE
+BxMHU2FsZm9yZDEaMBgGA1UEChMRQ09NT0RPIENBIExpbWl0ZWQxKzApBgNVBAMT
+IkNPTU9ETyBFQ0MgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMDgwMzA2MDAw
+MDAwWhcNMzgwMTE4MjM1OTU5WjCBhTELMAkGA1UEBhMCR0IxGzAZBgNVBAgTEkdy
+ZWF0ZXIgTWFuY2hlc3RlcjEQMA4GA1UEBxMHU2FsZm9yZDEaMBgGA1UEChMRQ09N
+T0RPIENBIExpbWl0ZWQxKzApBgNVBAMTIkNPTU9ETyBFQ0MgQ2VydGlmaWNhdGlv
+biBBdXRob3JpdHkwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAQDR3svdcmCFYX7deSR
+FtSrYpn1PlILBs5BAH+X4QokPB0BBO490o0JlwzgdeT6+3eKKvUDYEs2ixYjFq0J
+cfRK9ChQtP6IHG4/bC8vCVlbpVsLM5niwz2J+Wos77LTBumjQjBAMB0GA1UdDgQW
+BBR1cacZSBm8nZ3qQUfflMRId5nTeTAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0TAQH/
+BAUwAwEB/zAKBggqhkjOPQQDAwNoADBlAjEA7wNbeqy3eApyt4jf/7VGFAkK+qDm
+fQjGGoe9GKhzvSbKYAydzpmfz1wPMOG+FDHqAjAU9JM8SaczepBGR7NjfRObTrdv
+GDeAU/7dIOA1mjbRxwG55tzd8/8dLDoWV9mSOdY=
+-----END CERTIFICATE-----
+
+# Operating CA: Sectigo
+# Issuer: CN=COMODO RSA Certification Authority O=COMODO CA Limited
+# Subject: CN=COMODO RSA Certification Authority O=COMODO CA Limited
+# Label: "COMODO RSA Certification Authority"
+# Serial: 101909084537582093308941363524873193117
+# MD5 Fingerprint: 1b:31:b0:71:40:36:cc:14:36:91:ad:c4:3e:fd:ec:18
+# SHA1 Fingerprint: af:e5:d2:44:a8:d1:19:42:30:ff:47:9f:e2:f8:97:bb:cd:7a:8c:b4
+# SHA256 Fingerprint: 52:f0:e1:c4:e5:8e:c6:29:29:1b:60:31:7f:07:46:71:b8:5d:7e:a8:0d:5b:07:27:34:63:53:4b:32:b4:02:34
+-----BEGIN CERTIFICATE-----
+MIIF2DCCA8CgAwIBAgIQTKr5yttjb+Af907YWwOGnTANBgkqhkiG9w0BAQwFADCB
+hTELMAkGA1UEBhMCR0IxGzAZBgNVBAgTEkdyZWF0ZXIgTWFuY2hlc3RlcjEQMA4G
+A1UEBxMHU2FsZm9yZDEaMBgGA1UEChMRQ09NT0RPIENBIExpbWl0ZWQxKzApBgNV
+BAMTIkNPTU9ETyBSU0EgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMTAwMTE5
+MDAwMDAwWhcNMzgwMTE4MjM1OTU5WjCBhTELMAkGA1UEBhMCR0IxGzAZBgNVBAgT
+EkdyZWF0ZXIgTWFuY2hlc3RlcjEQMA4GA1UEBxMHU2FsZm9yZDEaMBgGA1UEChMR
+Q09NT0RPIENBIExpbWl0ZWQxKzApBgNVBAMTIkNPTU9ETyBSU0EgQ2VydGlmaWNh
+dGlvbiBBdXRob3JpdHkwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCR
+6FSS0gpWsawNJN3Fz0RndJkrN6N9I3AAcbxT38T6KhKPS38QVr2fcHK3YX/JSw8X
+pz3jsARh7v8Rl8f0hj4K+j5c+ZPmNHrZFGvnnLOFoIJ6dq9xkNfs/Q36nGz637CC
+9BR++b7Epi9Pf5l/tfxnQ3K9DADWietrLNPtj5gcFKt+5eNu/Nio5JIk2kNrYrhV
+/erBvGy2i/MOjZrkm2xpmfh4SDBF1a3hDTxFYPwyllEnvGfDyi62a+pGx8cgoLEf
+Zd5ICLqkTqnyg0Y3hOvozIFIQ2dOciqbXL1MGyiKXCJ7tKuY2e7gUYPDCUZObT6Z
++pUX2nwzV0E8jVHtC7ZcryxjGt9XyD+86V3Em69FmeKjWiS0uqlWPc9vqv9JWL7w
+qP/0uK3pN/u6uPQLOvnoQ0IeidiEyxPx2bvhiWC4jChWrBQdnArncevPDt09qZah
+SL0896+1DSJMwBGB7FY79tOi4lu3sgQiUpWAk2nojkxl8ZEDLXB0AuqLZxUpaVIC
+u9ffUGpVRr+goyhhf3DQw6KqLCGqR84onAZFdr+CGCe01a60y1Dma/RMhnEw6abf
+Fobg2P9A3fvQQoh/ozM6LlweQRGBY84YcWsr7KaKtzFcOmpH4MN5WdYgGq/yapiq
+crxXStJLnbsQ/LBMQeXtHT1eKJ2czL+zUdqnR+WEUwIDAQABo0IwQDAdBgNVHQ4E
+FgQUu69+Aj36pvE8hI6t7jiY7NkyMtQwDgYDVR0PAQH/BAQDAgEGMA8GA1UdEwEB
+/wQFMAMBAf8wDQYJKoZIhvcNAQEMBQADggIBAArx1UaEt65Ru2yyTUEUAJNMnMvl
+wFTPoCWOAvn9sKIN9SCYPBMtrFaisNZ+EZLpLrqeLppysb0ZRGxhNaKatBYSaVqM
+4dc+pBroLwP0rmEdEBsqpIt6xf4FpuHA1sj+nq6PK7o9mfjYcwlYRm6mnPTXJ9OV
+2jeDchzTc+CiR5kDOF3VSXkAKRzH7JsgHAckaVd4sjn8OoSgtZx8jb8uk2Intzna
+FxiuvTwJaP+EmzzV1gsD41eeFPfR60/IvYcjt7ZJQ3mFXLrrkguhxuhoqEwWsRqZ
+CuhTLJK7oQkYdQxlqHvLI7cawiiFwxv/0Cti76R7CZGYZ4wUAc1oBmpjIXUDgIiK
+boHGhfKppC3n9KUkEEeDys30jXlYsQab5xoq2Z0B15R97QNKyvDb6KkBPvVWmcke
+jkk9u+UJueBPSZI9FoJAzMxZxuY67RIuaTxslbH9qh17f4a+Hg4yRvv7E491f0yL
+S0Zj/gA0QHDBw7mh3aZw4gSzQbzpgJHqZJx64SIDqZxubw5lT2yHh17zbqD5daWb
+QOhTsiedSrnAdyGN/4fy3ryM7xfft0kL0fJuMAsaDk527RH89elWsn2/x20Kk4yl
+0MC2Hb46TpSi125sC8KKfPog88Tk5c0NqMuRkrF8hey1FGlmDoLnzc7ILaZRfyHB
+NVOFBkpdn627G190
+-----END CERTIFICATE-----
+
+# Operating CA: Sectigo
+# Issuer: CN=USERTrust ECC Certification Authority O=The USERTRUST Network
+# Subject: CN=USERTrust ECC Certification Authority O=The USERTRUST Network
+# Label: "USERTrust ECC Certification Authority"
+# Serial: 123013823720199481456569720443997572134
+# MD5 Fingerprint: fa:68:bc:d9:b5:7f:ad:fd:c9:1d:06:83:28:cc:24:c1
+# SHA1 Fingerprint: d1:cb:ca:5d:b2:d5:2a:7f:69:3b:67:4d:e5:f0:5a:1d:0c:95:7d:f0
+# SHA256 Fingerprint: 4f:f4:60:d5:4b:9c:86:da:bf:bc:fc:57:12:e0:40:0d:2b:ed:3f:bc:4d:4f:bd:aa:86:e0:6a:dc:d2:a9:ad:7a
+-----BEGIN CERTIFICATE-----
+MIICjzCCAhWgAwIBAgIQXIuZxVqUxdJxVt7NiYDMJjAKBggqhkjOPQQDAzCBiDEL
+MAkGA1UEBhMCVVMxEzARBgNVBAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNl
+eSBDaXR5MR4wHAYDVQQKExVUaGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMT
+JVVTRVJUcnVzdCBFQ0MgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMTAwMjAx
+MDAwMDAwWhcNMzgwMTE4MjM1OTU5WjCBiDELMAkGA1UEBhMCVVMxEzARBgNVBAgT
+Ck5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNleSBDaXR5MR4wHAYDVQQKExVUaGUg
+VVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMTJVVTRVJUcnVzdCBFQ0MgQ2VydGlm
+aWNhdGlvbiBBdXRob3JpdHkwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAQarFRaqflo
+I+d61SRvU8Za2EurxtW20eZzca7dnNYMYf3boIkDuAUU7FfO7l0/4iGzzvfUinng
+o4N+LZfQYcTxmdwlkWOrfzCjtHDix6EznPO/LlxTsV+zfTJ/ijTjeXmjQjBAMB0G
+A1UdDgQWBBQ64QmG1M8ZwpZ2dEl23OA1xmNjmjAOBgNVHQ8BAf8EBAMCAQYwDwYD
+VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAwNoADBlAjA2Z6EWCNzklwBBHU6+4WMB
+zzuqQhFkoJ2UOQIReVx7Hfpkue4WQrO/isIJxOzksU0CMQDpKmFHjFJKS04YcPbW
+RNZu9YO6bVi9JNlWSOrvxKJGgYhqOkbRqZtNyWHa0V1Xahg=
+-----END CERTIFICATE-----
+
+# Operating CA: Sectigo
+# Issuer: CN=USERTrust RSA Certification Authority O=The USERTRUST Network
+# Subject: CN=USERTrust RSA Certification Authority O=The USERTRUST Network
+# Label: "USERTrust RSA Certification Authority"
+# Serial: 2645093764781058787591871645665788717
+# MD5 Fingerprint: 1b:fe:69:d1:91:b7:19:33:a3:72:a8:0f:e1:55:e5:b5
+# SHA1 Fingerprint: 2b:8f:1b:57:33:0d:bb:a2:d0:7a:6c:51:f7:0e:e9:0d:da:b9:ad:8e
+# SHA256 Fingerprint: e7:93:c9:b0:2f:d8:aa:13:e2:1c:31:22:8a:cc:b0:81:19:64:3b:74:9c:89:89:64:b1:74:6d:46:c3:d4:cb:d2
+-----BEGIN CERTIFICATE-----
+MIIF3jCCA8agAwIBAgIQAf1tMPyjylGoG7xkDjUDLTANBgkqhkiG9w0BAQwFADCB
+iDELMAkGA1UEBhMCVVMxEzARBgNVBAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0pl
+cnNleSBDaXR5MR4wHAYDVQQKExVUaGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNV
+BAMTJVVTRVJUcnVzdCBSU0EgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMTAw
+MjAxMDAwMDAwWhcNMzgwMTE4MjM1OTU5WjCBiDELMAkGA1UEBhMCVVMxEzARBgNV
+BAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNleSBDaXR5MR4wHAYDVQQKExVU
+aGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMTJVVTRVJUcnVzdCBSU0EgQ2Vy
+dGlmaWNhdGlvbiBBdXRob3JpdHkwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIK
+AoICAQCAEmUXNg7D2wiz0KxXDXbtzSfTTK1Qg2HiqiBNCS1kCdzOiZ/MPans9s/B
+3PHTsdZ7NygRK0faOca8Ohm0X6a9fZ2jY0K2dvKpOyuR+OJv0OwWIJAJPuLodMkY
+tJHUYmTbf6MG8YgYapAiPLz+E/CHFHv25B+O1ORRxhFnRghRy4YUVD+8M/5+bJz/
+Fp0YvVGONaanZshyZ9shZrHUm3gDwFA66Mzw3LyeTP6vBZY1H1dat//O+T23LLb2
+VN3I5xI6Ta5MirdcmrS3ID3KfyI0rn47aGYBROcBTkZTmzNg95S+UzeQc0PzMsNT
+79uq/nROacdrjGCT3sTHDN/hMq7MkztReJVni+49Vv4M0GkPGw/zJSZrM233bkf6
+c0Plfg6lZrEpfDKEY1WJxA3Bk1QwGROs0303p+tdOmw1XNtB1xLaqUkL39iAigmT
+Yo61Zs8liM2EuLE/pDkP2QKe6xJMlXzzawWpXhaDzLhn4ugTncxbgtNMs+1b/97l
+c6wjOy0AvzVVdAlJ2ElYGn+SNuZRkg7zJn0cTRe8yexDJtC/QV9AqURE9JnnV4ee
+UB9XVKg+/XRjL7FQZQnmWEIuQxpMtPAlR1n6BB6T1CZGSlCBst6+eLf8ZxXhyVeE
+Hg9j1uliutZfVS7qXMYoCAQlObgOK6nyTJccBz8NUvXt7y+CDwIDAQABo0IwQDAd
+BgNVHQ4EFgQUU3m/WqorSs9UgOHYm8Cd8rIDZsswDgYDVR0PAQH/BAQDAgEGMA8G
+A1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEMBQADggIBAFzUfA3P9wF9QZllDHPF
+Up/L+M+ZBn8b2kMVn54CVVeWFPFSPCeHlCjtHzoBN6J2/FNQwISbxmtOuowhT6KO
+VWKR82kV2LyI48SqC/3vqOlLVSoGIG1VeCkZ7l8wXEskEVX/JJpuXior7gtNn3/3
+ATiUFJVDBwn7YKnuHKsSjKCaXqeYalltiz8I+8jRRa8YFWSQEg9zKC7F4iRO/Fjs
+8PRF/iKz6y+O0tlFYQXBl2+odnKPi4w2r78NBc5xjeambx9spnFixdjQg3IM8WcR
+iQycE0xyNN+81XHfqnHd4blsjDwSXWXavVcStkNr/+XeTWYRUc+ZruwXtuhxkYze
+Sf7dNXGiFSeUHM9h4ya7b6NnJSFd5t0dCy5oGzuCr+yDZ4XUmFF0sbmZgIn/f3gZ
+XHlKYC6SQK5MNyosycdiyA5d9zZbyuAlJQG03RoHnHcAP9Dc1ew91Pq7P8yF1m9/
+qS3fuQL39ZeatTXaw2ewh0qpKJ4jjv9cJ2vhsE/zB+4ALtRZh8tSQZXq9EfX7mRB
+VXyNWQKV3WKdwrnuWih0hKWbt5DHDAff9Yk2dDLWKMGwsAvgnEzDHNb842m1R0aB
+L6KCq9NjRHDEjf8tM7qtj3u1cIiuPhnPQCjY/MiQu12ZIvVS5ljFH4gxQ+6IHdfG
+jjxDah2nGN59PRbxYvnKkKj9
+-----END CERTIFICATE-----
+
+# Operating CA: SSL.com
+# Issuer: CN=SSL.com Client RSA Root CA 2022 O=SSL Corporation
+# Subject: CN=SSL.com Client RSA Root CA 2022 O=SSL Corporation
+# Label: SSL.com Client RSA Root CA 2022
+# Serial Number: 76AFEE88931545B650539B809CA4DF9A
+# SHA-1 Fingerprint: AA:59:70:E5:20:32:9F:CB:D0:D5:79:9F:FB:1B:82:1D:FD:1F:79:65
+# SHA-256 Fingerprint: 1D:4C:A4:A2:AB:21:D0:09:36:59:80:4F:C0:EB:21:75:A6:17:27:9B:56:A2:47:52:45:C9:51:7A:FE:B5:91:53
+-----BEGIN CERTIFICATE-----
+MIIFjzCCA3egAwIBAgIQdq/uiJMVRbZQU5uAnKTfmjANBgkqhkiG9w0BAQsFADBR
+MQswCQYDVQQGEwJVUzEYMBYGA1UECgwPU1NMIENvcnBvcmF0aW9uMSgwJgYDVQQD
+DB9TU0wuY29tIENsaWVudCBSU0EgUm9vdCBDQSAyMDIyMB4XDTIyMDgyNTE2MzEw
+N1oXDTQ2MDgxOTE2MzEwNlowUTELMAkGA1UEBhMCVVMxGDAWBgNVBAoMD1NTTCBD
+b3Jwb3JhdGlvbjEoMCYGA1UEAwwfU1NMLmNvbSBDbGllbnQgUlNBIFJvb3QgQ0Eg
+MjAyMjCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBALhY20Yw+8k/48jw
+ATM04tpIqBjpIG6a1wHh1SmPMLQjauTLYrC+4p8gvT5UoDlox4Y3ZnQGBu90K9rc
+n4SpUi+Q0u5+fPulIq1vcEZnlj0p1KO7VnsUBFnBIWNEHrIfElyQh2UNiPYeiCLi
+Y1S78zb41n/c2v8pNanGbg5pWz/YvoKHFXBdsMdcEg9jpjjNz3O5ww6JJjcbP2Ic
+MmnRm9n/VZAx3rFj3c/FdHf874ghU78AMRomLAAwpV9s4+T2AIrKmIecdAN6i2bs
+fv2jjzUlXHils6T7PW2pivBsiIKL/UrQb+TXo7SONEk4vs5F5dIcyl7CNxSLzWZW
+Mzed5WvsQ5JkoELadW/AFez5ab00uYp7+hb7Vf5SIOgEBFZWZfU3RJjIikbpt6y4
+6L5ijlQ2W/c7cL9d7i26X95CGYbwf4vrCMvYvuoOQkKgNnNXF+0y6tCN6Acbm5no
+xJpiBA5I9zwSuvdYwZqM6cewIzZWNB3LbNq6B4Qd/dGsn+bCie/DuWwYs2mHV1+1
+DDhbpyEkKjunNJGetFTqKE/TwaOL5OYr1fKdv5thACLd1ktEHz9dVv7enHjMmVuq
+5L2620NLrUwmTKNNNIpsdDYT22L8m7IFgf+uPwzN9hui9DnnyvVMXPtUdzWAWsAS
+oRMBM2c9nYGhqfWFJFiIeOf042hVAgMBAAGjYzBhMA8GA1UdEwEB/wQFMAMBAf8w
+HwYDVR0jBBgwFoAU8DhClDSpPAB/Uu45pfdLDbxqfSMwHQYDVR0OBBYEFPA4QpQ0
+qTwAf1LuOaX3Sw28an0jMA4GA1UdDwEB/wQEAwIBhjANBgkqhkiG9w0BAQsFAAOC
+AgEAmU/b8OrWEfoq/cirbeQOc2LSQp8V/nxwUj9kh4IxP0VALuEinwZmKfyW0y2N
+tjjH2fMnwVkpoIz2cyQPKCLXTmHdE93bnzJSk/tPzOo4PJhqA6sWryHRQq59RSvq
+xM+KWZ+CcHY6+GImyRCXWEAkpC25LymAJ+GJa3LKSQhxN1MF8YDO00IC0vzC0ZQG
+7gfi9oPif5/nu1bDW7/dlZMJHiTBzybNraSuwrRp56q17TeU6d3RY4VrmnpKVnbc
+GYUo1OTGpNi4lkF30LRZ8UYFh4cCH2m5ghjQQ9km2hpnqNZ1durybQ5C/4gmom6E
+/n5iG/DGPe3AHGrHkda4ADdJm7mEBaHNbjHWROpTi7pTmB2hkIrphfgb8pNYw8jc
+miZPPiDPT0PzEIx/EGF6NsqqC33Mn0dEWa6llcaZU+MHaz1JELAY/10OhUMUS+dr
+00q1smBh3GlJAiNd6JJxw5yfRWd5HtwyhrqqVTxkbzK1EEAV3nJAeOBucLtu6wno
+OdmsupJ13UPKugGVrRqBKzrw48UvDBhNEMauwO3+BVJ/GQXLqa81CAw4IuT+VuVT
+Pr/k1rPZCMM91TMygSTFqeFlEbgyMzBxGEkdGkXGmhSKWDkobvPLUblJJmR4A8eR
+EYOpuZA0tm+qBZ6FKFeZvn8nBkliTaH8CeErRglMFJtWj0U=
+-----END CERTIFICATE-----
+
+# Operating CA: SSL.com
+# Issuer: CN=SSL.com Client ECC Root CA 2022 O=SSL Corporation
+# Subject: CN=SSL.com Client ECC Root CA 2022 O=SSL Corporation
+# Label: SSL.com Client ECC Root CA 2022
+# Serial Number: 76F8481EAEF03C701FE03F25540183D5
+# SHA-1 Fingerprint: 80:7B:1D:9D:65:72:3D:C7:56:F9:EC:C5:00:83:49:F6:F2:AC:F4:86
+# SHA-256 Fingerprint: AD:7D:D5:8D:03:AE:DB:22:A3:0B:50:84:39:49:20:CE:12:23:0C:2D:80:17:AD:9B:81:AB:04:07:9B:DD:02:6B
+-----BEGIN CERTIFICATE-----
+MIICQDCCAcagAwIBAgIQdvhIHq7wPHAf4D8lVAGD1TAKBggqhkjOPQQDAzBRMQsw
+CQYDVQQGEwJVUzEYMBYGA1UECgwPU1NMIENvcnBvcmF0aW9uMSgwJgYDVQQDDB9T
+U0wuY29tIENsaWVudCBFQ0MgUm9vdCBDQSAyMDIyMB4XDTIyMDgyNTE2MzAzMloX
+DTQ2MDgxOTE2MzAzMVowUTELMAkGA1UEBhMCVVMxGDAWBgNVBAoMD1NTTCBDb3Jw
+b3JhdGlvbjEoMCYGA1UEAwwfU1NMLmNvbSBDbGllbnQgRUNDIFJvb3QgQ0EgMjAy
+MjB2MBAGByqGSM49AgEGBSuBBAAiA2IABC1Tfp+LPrM2ulDizOvcuiaK04wGP2cP
+7/UX5dSumkYqQQEHaedncfHCAzbG8CtSjs8UkmikPnBREmmNeKKCyikUwOSUIrJE
+kmBvyASkZ9Wi0PPQ1+qOPA+60kBHkDTufaNjMGEwDwYDVR0TAQH/BAUwAwEB/zAf
+BgNVHSMEGDAWgBS3/i1ixYFTzVIaL11goMNd+7IcHDAdBgNVHQ4EFgQUt/4tYsWB
+U81SGi9dYKDDXfuyHBwwDgYDVR0PAQH/BAQDAgGGMAoGCCqGSM49BAMDA2gAMGUC
+ME0HES0R+7kmwyHdcuEX/MHPFOpJznGHjtZT3BHNXVSKr9kt9IxR6rxmR+J/lYNg
+ZQIxAIwhTE+75bBQ35BiSebMkdv4P11xkQiOT5LJf6Zc6hN+7W3E6MMqb1wR4aXz
+alqaTQ==
+-----END CERTIFICATE-----
+)CERT";
+
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include "time.h"
+
+#include <Wire.h>
+#include <RTClib.h>    // RTClib by Adafruit — install via Library Manager
+#include <LittleFS.h>  // Built-in with ESP32 Arduino core ≥ 2.0
+
+
+
+const String FB_HOST = "https://smart-bell-b2fc0-default-rtdb.asia-southeast1.firebasedatabase.app";
+
+
+#define RELAY_PIN   26     // GPIO → Relay IN1 (unchanged)
+#define RELAY_ON    LOW    // Active-LOW relay: LOW = bell ON
+#define RELAY_OFF   HIGH   // HIGH = bell OFF
+
+#define RTC_SDA     21
+#define RTC_SCL     22
+
+
+#define NTP_SERVER              "pool.ntp.org"
+#define UTC_OFFSET_SEC          19800   // IST = UTC +5:30
+#define DST_OFFSET_SEC          0
+
+#define POLL_MS                 750    // Firebase command poll interval
+#define SYNC_MS                 15000   // Schedule sync interval
+#define HB_MS                   30000   // Heartbeat interval
+#define WIFI_CONN_TIMEOUT_P     12000   // Primary WiFi timeout (ms)
+#define WIFI_CONN_TIMEOUT_S     15000   // Secondary WiFi timeout (ms)
+#define WIFI_RETRY_OFFLINE_MS   60000   // Retry when fully offline
+#define RTC_NTP_SYNC_DIFF_SEC   60      // Only update RTC if NTP diff > this
+#define RTC_NTP_SYNC_INTERVAL   86400000UL // Periodic NTP→RTC sync (24h in ms)
+#define SECONDARY_TEST_TIMEOUT  12000   // Max time to test pending secondary
+
+
+#define MAX_PERIODS    30
+#define MAX_EXAM       50
+#define MAX_HOLIDAYS   60
+#define MAX_HOL_RANGES 20
+#define MAX_EXAM_DATES 30
+
+
+struct Period {
+  String time;       // "HH:MM"
+  int    duration;   // seconds
+  String label;
+};
+
+struct ExamBell {
+  String date;       // "YYYY-MM-DD"
+  String time;       // "HH:MM"
+  int    duration;
+  String label;
+};
+
+struct HolidayRange {
+  String start;      // "YYYY-MM-DD"
+  String end;
+  String label;
+};
+
+Period       regularPeriods[MAX_PERIODS];   int regularCount    = 0;
+ExamBell     examBells[MAX_EXAM];           int examCount       = 0;
+String       holidays[MAX_HOLIDAYS];        int holidayCount    = 0;
+HolidayRange holidayRanges[MAX_HOL_RANGES]; int holidayRangeCount = 0;
+String       examDates[MAX_EXAM_DATES];     int examDateCount   = 0;
+
+
+RTC_DS3231   rtc;
+Preferences  prefs;
+
+bool     rtcAvailable    = false;
+bool     rtcValid        = false;
+bool     fsAvailable     = false;
+
+String   dynSSID1 = "", dynPASS1 = "";
+String   dynSSID2 = "", dynPASS2 = "";
+
+String   pendingSSID2 = "", pendingPASS2 = "";
+bool     hasPendingSecondary = false;
+int      pendingSecondaryVersion = 0;
+int      committedSecondaryVersion = 0;
+
+unsigned long lastPollMs        = 0;
+unsigned long lastSyncMs        = 0;
+unsigned long lastHbMs          = 0;
+unsigned long lastRtcNtpSyncMs  = 0;
+unsigned long lastSchedSyncMs   = 0;   // Fix #11: last successful schedule sync
+unsigned long wifiStateEnteredMs = 0;
+
+String lastEventId = "";
+
+int      scheduleVersion    = 0;
+int      cachedSchedVersion = -1; // -1 = unknown/not loaded
+
+String   cachedMode = "regular";
+
+bool     isOnline    = false;
+bool     usingPrimary = true;
+
+
+String lastSlot="", bootSlot="", lastManualId="", manualResult="", lastRestartId="";
+uint64_t lastManualIssued=0;
+bool guardStorage=false;
+std::atomic<bool> relayBusy(false);
+esp_timer_handle_t relayTimer=nullptr;
+bool relayTimerReady56=false;
+// Access these only under relayMux54, including from the timer callback.
+int64_t relayStartedUs56=0,relayDeadlineUs56=0;
+uint32_t completedPulseMs56=0,pulseSequence56=0;
+int completedDuration56=0,activeDuration56=0;
+
+std::atomic<uint32_t> ntpGeneration(0);
+uint32_t ntpAppliedGeneration=0;
+bool pendingPrimary=false, trialActive=false, oldWasPrimary=true, wifiResultDirty=false;
+String candidateSSID="",candidatePASS="",wifiResultJSON="",scheduleError="";
+int candidateVersion=0,primaryProcessed=0,secondaryProcessed=0;
+uint32_t trialStart=0,cacheSequence=0;
+String scheduleBody="";
+uint32_t lastWifiPoll=0;
+
+// The HTTP worker owns its client. The main task owns clocks, schedules and NVS.
+struct HttpJob54 {String method,path,body,result;int code=0;uint32_t elapsed=0;};
+HttpJob54 httpJob54;
+QueueHandle_t httpQueue54=nullptr;
+SemaphoreHandle_t httpDone54=nullptr;
+TaskHandle_t httpTask54=nullptr;
+portMUX_TYPE relayMux54=portMUX_INITIALIZER_UNLOCKED;
+bool scheduleCached54=false,manualActive54=false;
+String activeManualID54="";
+String autoStatus54="Waiting for clock and timetable",relayError54="";
+uint32_t lastCommandPoll54=0,lastHttpMs54=0,lastClockRead54=0;
+uint64_t manualLatency54=0;
+int lastHttpCode54=0;
+int lastRingDuration55=0,manualDuration55=0;
+uint64_t lastPulseStartEpochMs57=0,lastPulseEndEpochMs57=0;
+// Journal writes happen BEFORE activation and AFTER cutoff, never in timer callbacks.
+// A pending journal after boot means completion could not be confirmed; do not replay it.
+bool previousPulseUnconfirmed58=false,pulseJournalError58=false;
+int previousPulseSec58=0;
+String previousPulseID58="";
+uint32_t manualPulseMs58=0;
+void restorePulseJournal58();
+bool savePulseJournal58(int seconds,const String& id);
+void clearPulseJournal58();
+
+bool clockUsable54=false,clockReadOnce54=false;
+DateTime clockSnapshot54(2024,1,1,0,0,0);
+void httpWorker54(void*);
+String httpRequest54(const String& method,const String& path,const String& body,int& code);
+void serviceLocal54();
+void servicePulse57();
+void refreshClock54();
+
+enum WiFiSMState {
+  WS_INIT,                  // Boot, not started
+  WS_CONNECTING_PRIMARY,    // Attempting college WiFi
+  WS_CONNECTED_PRIMARY,     // Online via college WiFi
+  WS_CONNECTING_SECONDARY,  // Attempting admin hotspot
+  WS_CONNECTED_SECONDARY,   // Online via admin hotspot
+  WS_OFFLINE,               // Both failed, retrying periodically
+  WS_TESTING_PENDING        // Safely testing new secondary credentials
+};
+
+WiFiSMState wifiSM = WS_INIT;
+
+const char* wifiStateName(WiFiSMState s);
+void enterWifiState(WiFiSMState s);
+bool isConnected();
+void beginConnectPrimary();
+void beginConnectSecondary();
+void wifiStateMachine();
+void testAndCommitPendingSecondary();
+void saveToNVS(const char* key, int val);
+void saveToNVS(const char* key, const String& val);
+int loadFromNVS_int(const char* key, int def = 0);
+String loadFromNVS_str(const char* key, const String& def = "");
+void loadWiFiFromNVS();
+bool saveWiFiToNVS();
+void loadLastBellKey();
+void serviceRelay56();
+void relayTick56(void*);
+void reportPulse56();
+bool reserveMinute(const String& slot);
+bool initRTC();
+uint32_t getRTCEpoch();
+time_t getEpochSec();
+void syncNTPandRTC();
+void setRTCManual(int y, int mo, int d, int h, int mi, int s);
+String getTimeStr();
+String getDateStr();
+String getDateTimeStr();
+int getDOW();
+int getDOM();
+bool initFS();
+String fbGet(const String& path);
+bool fbPut(const String& path, const String& body);
+bool fbDelete(const String& path);
+bool ringBell(int durationSec,const String& label,const String& requestID58="");
+bool isSunday();
+bool isSecondSaturday();
+bool isInRange(const String& today, const String& s, const String& e);
+bool isHoliday(const String& today);
+bool isExamDay(const String& today);
+void checkAutoBell();
+void fetchWiFiConfig();
+void fetchTimeConfig();
+void checkCommand();
+void checkRestartCommand();
+void sendHeartbeat();
+void setup();
+void loop();
+bool validTime52(const String& t);
+bool validDate52(const String& t);
+bool applySnapshot52(JsonVariantConst d,bool apply);
+uint32_t cacheHash52(const String& s);
+String cachePath52(int slot);
+bool readCache52(int slot,String& raw,uint32_t& seq);
+bool writeCache52(const String& raw);
+bool loadScheduleFromFS();
+void fetchAllSchedule();
+
+const char* wifiStateName(WiFiSMState s) {
+  switch(s) {
+    case WS_INIT:               return "INIT";
+    case WS_CONNECTING_PRIMARY: return "CONNECTING_PRIMARY";
+    case WS_CONNECTED_PRIMARY:  return "CONNECTED_PRIMARY";
+    case WS_CONNECTING_SECONDARY: return "CONNECTING_SECONDARY";
+    case WS_CONNECTED_SECONDARY: return "CONNECTED_SECONDARY";
+    case WS_OFFLINE:            return "OFFLINE";
+    case WS_TESTING_PENDING:    return "TESTING_PENDING";
+    default:                    return "UNKNOWN";
+  }
+}
+
+void enterWifiState(WiFiSMState s) {
+  if (wifiSM != s) {
+    Serial.printf("[WiFiSM] %s → %s\n", wifiStateName(wifiSM), wifiStateName(s));
+  }
+  wifiSM = s;
+  wifiStateEnteredMs = millis();
+}
+
+bool isConnected() { return WiFi.status()==WL_CONNECTED; }
+
+void beginConnectPrimary() {
+  WiFi.disconnect(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(dynSSID1.c_str(), dynPASS1.c_str());
+  Serial.println("[WiFiSM] Starting primary: " + dynSSID1);
+  enterWifiState(WS_CONNECTING_PRIMARY);
+}
+
+void beginConnectSecondary() {
+  WiFi.disconnect(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(dynSSID2.c_str(), dynPASS2.c_str());
+  Serial.println("[WiFiSM] Starting secondary: " + dynSSID2);
+  enterWifiState(WS_CONNECTING_SECONDARY);
+}
+
+void wifiStateMachine() {
+  unsigned long now = millis();
+  wl_status_t ws = WiFi.status();
+
+  switch (wifiSM) {
+
+    case WS_INIT:
+      beginConnectPrimary();
+      break;
+
+    case WS_CONNECTING_PRIMARY:
+      if (ws == WL_CONNECTED && WiFi.SSID()==dynSSID1) {
+        usingPrimary = true;
+        isOnline = true;
+        Serial.println("[WiFiSM] ✓ Primary connected. IP: " + WiFi.localIP().toString());
+        // FIX #4: Only sync RTC on connect if RTC is invalid OR not synced in >6h.
+        // Do NOT blindly rewrite DS3231 on every reconnect.
+        if (!rtcValid || millis() - lastRtcNtpSyncMs > 21600000UL) {
+          syncNTPandRTC();
+        }
+        enterWifiState(WS_CONNECTED_PRIMARY);
+      } else if (now - wifiStateEnteredMs > WIFI_CONN_TIMEOUT_P) {
+        Serial.println("[WiFiSM] Primary timeout. Trying secondary...");
+        beginConnectSecondary();
+      }
+      break;
+
+    case WS_CONNECTED_PRIMARY:
+      if (ws != WL_CONNECTED) {
+        isOnline = false;
+        Serial.println("[WiFiSM] Primary lost. Reconnecting...");
+        beginConnectPrimary();
+      }
+      break;
+
+    case WS_CONNECTING_SECONDARY:
+      if (ws == WL_CONNECTED && WiFi.SSID()==dynSSID2) {
+        usingPrimary = false;
+        isOnline = true;
+        Serial.println("[WiFiSM] ✓ Secondary connected. IP: " + WiFi.localIP().toString());
+        // FIX #4: Same guard — only sync RTC if invalid or stale (>6h).
+        if (!rtcValid || millis() - lastRtcNtpSyncMs > 21600000UL) {
+          syncNTPandRTC();
+        }
+        enterWifiState(WS_CONNECTED_SECONDARY);
+      } else if (now - wifiStateEnteredMs > WIFI_CONN_TIMEOUT_S) {
+        isOnline = false;
+        Serial.println("[WiFiSM] Both networks unavailable → OFFLINE mode.");
+        Serial.println("[WiFiSM] Bell will use DS3231 + cached schedule.");
+        WiFi.disconnect(false);
+        enterWifiState(WS_OFFLINE);
+      }
+      break;
+
+    case WS_CONNECTED_SECONDARY:
+      if (ws != WL_CONNECTED) {
+        isOnline = false;
+        Serial.println("[WiFiSM] Secondary lost. Trying primary first...");
+        beginConnectPrimary();
+        break;
+      }
+      // Keep a healthy secondary connection. Probing primary with WiFi.begin()
+      // would disconnect the current AP and interrupt app commands every 5 min.
+      // Explicit website Wi-Fi changes still use the verified trial workflow.
+      break;
+
+    case WS_OFFLINE:
+      // Retry connection periodically
+      if (now - wifiStateEnteredMs > WIFI_RETRY_OFFLINE_MS) {
+        Serial.println("[WiFiSM] Retrying connection from OFFLINE...");
+        beginConnectPrimary();
+      }
+      break;
+
+    case WS_TESTING_PENDING:
+      // Handled in testAndCommitPendingSecondary() — called from main loop
+      break;
+  }
+}
+
+
+void testAndCommitPendingSecondary() {
+  if(!trialActive)return;
+  bool associated=WiFi.status()==WL_CONNECTED && WiFi.SSID()==candidateSSID;
+  if(!associated && millis()-trialStart<20000)return;
+  bool success=false; String reason="connection_failed";
+  if(associated) {
+    // A successful GET, including JSON null, proves this database is reachable.
+    String response=fbGet("/config/mode");success=response.length()>0;reason="database_unreachable";
+  }
+  String oldSSID=pendingPrimary?dynSSID1:dynSSID2,oldPASS=pendingPrimary?dynPASS1:dynPASS2;
+  if(success) {
+    if(pendingPrimary){dynSSID1=candidateSSID;dynPASS1=candidatePASS;}
+    else{dynSSID2=candidateSSID;dynPASS2=candidatePASS;}
+    if(!saveWiFiToNVS()) {
+      success=false;reason="storage_failed";
+      if(pendingPrimary){dynSSID1=oldSSID;dynPASS1=oldPASS;}else{dynSSID2=oldSSID;dynPASS2=oldPASS;}
+    }
+  }
+  StaticJsonDocument<512> d;d["target"]=pendingPrimary?"primary":"secondary";
+  d["version"]=candidateVersion;d["ssid"]=candidateSSID;d["success"]=success;
+  d["state"]=success?"saved":reason.c_str();d["ts"]=(uint64_t)getEpochSec();
+  wifiResultJSON="";serializeJson(d,wifiResultJSON);saveToNVS("sb_wifi52",wifiResultJSON);wifiResultDirty=true;
+  trialActive=false;hasPendingSecondary=false;candidatePASS="";
+  if(success) {
+    usingPrimary=pendingPrimary;isOnline=true;
+    enterWifiState(usingPrimary?WS_CONNECTED_PRIMARY:WS_CONNECTED_SECONDARY);
+    Serial.println("[WiFi] Verified and saved: "+candidateSSID);
+  } else {
+    Serial.println("[WiFi] Test failed; restoring previous network: "+reason);
+    if(oldWasPrimary)beginConnectPrimary();else beginConnectSecondary();
+  }
+}
+
+
+void saveToNVS(const char* key, int val) {
+  prefs.begin("smartbell", false);
+  prefs.putInt(key, val);
+  prefs.end();
+}
+void saveToNVS(const char* key, const String& val) {
+  prefs.begin("smartbell", false);
+  prefs.putString(key, val);
+  prefs.end();
+}
+int loadFromNVS_int(const char* key, int def) {
+  prefs.begin("smartbell", true);
+  int v = prefs.getInt(key, def);
+  prefs.end();
+  return v;
+}
+String loadFromNVS_str(const char* key, const String& def) {
+  prefs.begin("smartbell", true);
+  String v = prefs.getString(key, def);
+  prefs.end();
+  return v;
+}
+
+void loadWiFiFromNVS() {
+  prefs.begin("smartbell",true);
+  String packet=prefs.getString("sb_net52","");
+  dynSSID1=prefs.getString("sb_ssid1",FB_SSID1);dynPASS1=prefs.getString("sb_pass1",FB_PASS1);
+  dynSSID2=prefs.getString("sb_ssid2",FB_SSID2);dynPASS2=prefs.getString("sb_pass2",FB_PASS2);
+  primaryProcessed=prefs.getInt("sb_pr52",0);secondaryProcessed=prefs.getInt("sb_sc52",0);
+  wifiResultJSON=prefs.getString("sb_wifi52","");wifiResultDirty=wifiResultJSON.length()>0;
+  prefs.end();
+  if(wifiResultJSON.length()) {
+    StaticJsonDocument<512> status;
+    if(!deserializeJson(status,wifiResultJSON) && String(status["state"]|"")=="testing") {
+      status["state"]="interrupted_check_saved_network";status["success"]=false;
+      wifiResultJSON="";serializeJson(status,wifiResultJSON);
+    }
+  }
+  StaticJsonDocument<1024> d;
+  if(packet.length()&&!deserializeJson(d,packet)) {
+    appliedWiFiSetupRevision=d["setupRevision"]|0;
+    dynSSID1=d["ssid1"]|dynSSID1;dynPASS1=d["pass1"]|dynPASS1;
+    dynSSID2=d["ssid2"]|dynSSID2;dynPASS2=d["pass2"]|dynPASS2;
+  }
+  if(!dynSSID1.length()){dynSSID1=FB_SSID1;dynPASS1=FB_PASS1;}
+  if(!dynSSID2.length()){dynSSID2=FB_SSID2;dynPASS2=FB_PASS2;}
+  // Apply an explicit USB recovery once, atomically with the credential packet.
+  // Later cloud changes keep setupRevision, so reboot cannot undo them.
+  if(WIFI_SETUP_REVISION>appliedWiFiSetupRevision) {
+    bool primaryConfigured=FB_SSID1.length()>0 && FB_SSID1.length()<=32 &&
+      FB_SSID1!="CollegeWiFi" && FB_PASS1!="college_password" &&
+      FB_PASS1.length()>=8 && FB_PASS1.length()<=63;
+    if(primaryConfigured) {
+      dynSSID1=FB_SSID1;dynPASS1=FB_PASS1;
+      if(FB_SSID2.length()>0 && FB_SSID2.length()<=32 &&
+         FB_SSID2!="MobileHotspot" && FB_PASS2!="hotspot_password" &&
+         FB_PASS2.length()>=8 && FB_PASS2.length()<=63) {
+        dynSSID2=FB_SSID2;dynPASS2=FB_PASS2;
+      }
+      appliedWiFiSetupRevision=WIFI_SETUP_REVISION;
+      if(saveWiFiToNVS())Serial.println("[WiFi] USB recovery saved. Website Wi-Fi changes remain enabled.");
+      else Serial.println("[WiFi] Recovery storage failed; using code credentials for this boot.");
+    } else {
+      Serial.println("[WiFi] Recovery not applied: enter your real primary SSID/password at the top of the sketch.");
+    }
+  }
+  Serial.println("[WiFi] Stored primary: "+dynSSID1+"; secondary: "+dynSSID2);
+}
+
+bool saveWiFiToNVS() {
+  StaticJsonDocument<1024> d;d["ssid1"]=dynSSID1;d["pass1"]=dynPASS1;d["ssid2"]=dynSSID2;d["pass2"]=dynPASS2;
+  d["setupRevision"]=appliedWiFiSetupRevision;
+  String raw;serializeJson(d,raw);
+  if(!prefs.begin("smartbell",false))return false;
+  bool ok=prefs.putString("sb_net52",raw)==raw.length();prefs.end();return ok;
+}
+
+
+void loadLastBellKey() {
+  guardStorage=prefs.begin("smartbell",true);
+  if(guardStorage) {
+    lastSlot=prefs.getString("sb_slot52","");lastManualId=prefs.getString("sb_cmd52","");
+    lastManualIssued=prefs.getULong64("sb_cmdAt52",0);lastRestartId=prefs.getString("sb_rst52","");prefs.end();
+  }
+  // Absence of the namespace on a fresh board is normal; test opening for writes.
+  guardStorage=prefs.begin("smartbell",false);if(guardStorage)prefs.end();
+  bootSlot=getDateStr()+"_"+getTimeStr();
+}
+bool savePulseJournal58(int seconds,const String& id) {
+  if(!prefs.begin("smartbell",false))return false;
+  StaticJsonDocument<384>d;d["seconds"]=seconds;d["id"]=id;
+  String raw;serializeJson(d,raw);
+  bool ok=prefs.putString("sb_pulse58",raw)==raw.length();prefs.end();
+  return ok;
+}
+void clearPulseJournal58() {
+  if(!prefs.begin("smartbell",false)){pulseJournalError58=true;return;}
+  pulseJournalError58=!prefs.remove("sb_pulse58");prefs.end();
+}
+void restorePulseJournal58() {
+  if(!prefs.begin("smartbell",true))return;
+  String raw=prefs.getString("sb_pulse58","");prefs.end();
+  if(!raw.length())return;
+  previousPulseUnconfirmed58=true;
+  StaticJsonDocument<384>d;
+  if(!deserializeJson(d,raw)) {
+    previousPulseSec58=d["seconds"]|0;previousPulseID58=d["id"]|"";
+  }
+  if(previousPulseID58.length()&&previousPulseID58==lastManualId) {
+    manualResult="interrupted";manualDuration55=previousPulseSec58;
+  }
+  Serial.printf("[PULSE UNCONFIRMED] Previous %ds request was not confirmed complete before restart; reset reason=%d. Not replaying.\n",previousPulseSec58,(int)esp_reset_reason());
+}
+// A callback checks the current pulse's deadline; it never blindly ends a pulse.
+// The main loop also calls this while waiting for Firebase as a fallback.
+void serviceRelay56() {
+  portENTER_CRITICAL(&relayMux54);
+  if(relayBusy.load() && esp_timer_get_time()>=relayDeadlineUs56) {
+    gpio_set_level((gpio_num_t)RELAY_PIN,RELAY_OFF);
+    completedPulseMs56=(uint32_t)((esp_timer_get_time()-relayStartedUs56)/1000LL);
+    completedDuration56=activeDuration56;++pulseSequence56;
+    relayBusy=false;
+  }
+  portEXIT_CRITICAL(&relayMux54);
+}
+void relayTick56(void*) { serviceRelay56(); }
+void reportPulse56() {
+  static uint32_t reported=0;
+  uint32_t sequence,elapsed;int seconds;
+  portENTER_CRITICAL(&relayMux54);
+  sequence=pulseSequence56;elapsed=completedPulseMs56;seconds=completedDuration56;
+  portEXIT_CRITICAL(&relayMux54);
+  if(sequence!=reported) {
+    reported=sequence;
+    clearPulseJournal58();
+    if(manualActive54)manualPulseMs58=elapsed;
+    lastPulseEndEpochMs57=lastPulseStartEpochMs57+elapsed;
+    Serial.printf("[PULSE END] requested=%ds GPIO-active=%lu ms\n",seconds,(unsigned long)elapsed);
+    lastHbMs=millis()-10000;
+  }
+}
+bool reserveMinute(const String& slot) {
+  if(!guardStorage || !guard::newSlot(slot.c_str(),lastSlot.c_str()))return false;
+  if(!prefs.begin("smartbell",false))return false;
+  bool ok=prefs.putString("sb_slot52",slot)==slot.length();prefs.end();
+  if(ok)lastSlot=slot;return ok;
+}
+
+
+bool initRTC() {
+  Wire.begin(RTC_SDA, RTC_SCL);
+  Wire.setTimeOut(50);
+  if (!rtc.begin()) {
+    Serial.println("[RTC] ✗ DS3231 not found on I2C bus!");
+    Serial.println("[RTC] Check wiring: SDA=GPIO21, SCL=GPIO22, VCC=3.3V");
+    return false;
+  }
+  Serial.println("[RTC] ✓ DS3231 found.");
+
+  // lostPower() is true when backup battery ran out or first use
+  if (rtc.lostPower()) {
+    Serial.println("[RTC] ⚠ RTC power was lost — time may be invalid.");
+    Serial.println("[RTC] Will sync from NTP when WiFi available.");
+    // Do NOT set time here — never silently overwrite with compile timestamp!
+    rtcValid = false;
+  } else {
+    DateTime now = rtc.now();
+    // Sanity check: year must be 2024-2035 for a newly deployed bell system
+    if (now.isValid() && now.year() >= 2024 && now.year() <= 2035) {
+      rtcValid = true;
+      char buf[24];
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+               now.year(), now.month(), now.day(),
+               now.hour(), now.minute(), now.second());
+      Serial.printf("[RTC] ✓ Valid time: %s IST\n", buf);
+    } else {
+      Serial.printf("[RTC] ⚠ Invalid year: %d — needs NTP or manual sync.\n", now.year());
+      rtcValid = false;
+    }
+  }
+  return true;
+}
+
+uint32_t getRTCEpoch() {
+  if (!rtcAvailable) return 0;
+  return rtc.now().unixtime();
+}
+
+time_t getEpochSec() { return time(nullptr); }
+uint64_t getEpochMillis57() {
+  struct timeval tv;gettimeofday(&tv,nullptr);
+  return (uint64_t)tv.tv_sec*1000ULL+(uint64_t)tv.tv_usec/1000ULL;
+}
+
+void syncNTPandRTC() {
+  if(ntpGeneration.load()==ntpAppliedGeneration)return;
+  if(rtcValid && lastRtcNtpSyncMs && millis()-lastRtcNtpSyncMs<RTC_NTP_SYNC_INTERVAL)return;
+  struct tm t;if(!getLocalTime(&t,0))return;
+  ntpAppliedGeneration=ntpGeneration.load();lastRtcNtpSyncMs=millis();
+  if(!rtcAvailable)return;
+  DateTime exact(t.tm_year+1900,t.tm_mon+1,t.tm_mday,t.tm_hour,t.tm_min,t.tm_sec);
+  int64_t diff=(int64_t)exact.unixtime()-(int64_t)rtc.now().unixtime();
+  if(!rtcValid||llabs(diff)>RTC_NTP_SYNC_DIFF_SEC){rtc.adjust(exact);rtcValid=true;clockReadOnce54=false;bootSlot=getDateStr()+"_"+getTimeStr();}
+}
+
+void setRTCManual(int y, int mo, int d, int h, int mi, int s) {
+  if (!rtcAvailable) return;
+  rtc.adjust(DateTime(y, mo, d, h, mi, s));
+  rtcValid = true;clockReadOnce54=false;
+  Serial.printf("[RTC] Manually set to: %04d-%02d-%02d %02d:%02d:%02d IST\n",
+                y, mo, d, h, mi, s);
+}
+
+
+void refreshClock54() {
+  uint32_t ms=millis();if(clockReadOnce54&&ms-lastClockRead54<200)return;
+  clockReadOnce54=true;lastClockRead54=ms;
+  if(rtcAvailable) {
+    Wire.beginTransmission(0x68);
+    if(Wire.endTransmission()!=0){rtcAvailable=false;rtcValid=false;Serial.println("[RTC] Lost I2C connection; using system clock");}
+    else if(rtcValid) {
+      DateTime dt=rtc.now();
+      if(dt.isValid()&&dt.year()>=2024&&dt.year()<=2035&&!rtc.lostPower()) {clockSnapshot54=dt;clockUsable54=true;return;}
+      rtcValid=false;Serial.println("[RTC] Invalid time; waiting for NTP correction");
+    }
+  }
+  struct tm t;
+  clockUsable54=getLocalTime(&t,0)&&t.tm_year+1900>=2024&&t.tm_year+1900<=2035;
+  if(clockUsable54)clockSnapshot54=DateTime(t.tm_year+1900,t.tm_mon+1,t.tm_mday,t.tm_hour,t.tm_min,t.tm_sec);
+}
+String getTimeStr() {
+  refreshClock54();if(!clockUsable54)return "";char b[6];snprintf(b,sizeof(b),"%02d:%02d",clockSnapshot54.hour(),clockSnapshot54.minute());return String(b);
+}
+String getDateStr() {
+  refreshClock54();if(!clockUsable54)return "";char b[11];snprintf(b,sizeof(b),"%04d-%02d-%02d",clockSnapshot54.year(),clockSnapshot54.month(),clockSnapshot54.day());return String(b);
+}
+String getDateTimeStr() {
+  refreshClock54();if(!clockUsable54)return "Unknown";char b[20];snprintf(b,sizeof(b),"%04d-%02d-%02d %02d:%02d:%02d",clockSnapshot54.year(),clockSnapshot54.month(),clockSnapshot54.day(),clockSnapshot54.hour(),clockSnapshot54.minute(),clockSnapshot54.second());return String(b);
+}
+int getDOW() {refreshClock54();return clockUsable54?clockSnapshot54.dayOfTheWeek():-1;}
+int getDOM() {refreshClock54();return clockUsable54?clockSnapshot54.day():-1;}
+
+bool initFS() {
+  for (int attempt = 1; attempt <= 2; attempt++) {
+    if (LittleFS.begin(false)) {  // never auto-formats: erasing needs the explicit FORMAT command
+      Serial.println("[FS] LittleFS mounted OK.");
+      return true;
+    }
+    if (attempt < 2) { Serial.println("[FS] LittleFS mount failed! Retrying..."); delay(250); }
+  }
+  Serial.println("[FS] LittleFS mount failed!");
+  Serial.println("[FS] Persistent timetable storage unavailable this boot.");
+  Serial.println("[FS] Repair: type FORMAT here to erase and rebuild ONLY the cache storage.");
+  Serial.println("[FS] Wi-Fi settings and the cloud timetable are kept by FORMAT.");
+  return false;
+}
+
+
+
+
+void httpWorker54(void*) {
+  WiFiClientSecure client;client.setCACert(TRUST_ROOTS);client.setHandshakeTimeout(3);
+  HTTPClient http;http.setReuse(true);http.setConnectTimeout(1500);http.setTimeout(1500);
+  for(;;) {
+    uint8_t token;if(xQueueReceive(httpQueue54,&token,portMAX_DELAY)!=pdTRUE)continue;
+    uint32_t start=millis();httpJob54.result="";httpJob54.code=-1;
+    if(http.begin(client,FB_HOST+httpJob54.path+".json")) {
+      if(httpJob54.method=="PUT")http.addHeader("Content-Type","application/json");
+      int code=httpJob54.method=="GET"?http.GET():http.sendRequest(httpJob54.method.c_str(),httpJob54.body);
+      httpJob54.code=code;
+      // Consume response bodies before reusing the connection, including PUT replies.
+      if(code>0&&http.getSize()<=65536)httpJob54.result=http.getString();
+      else client.stop();
+      if(httpJob54.result.length()>65536){httpJob54.result="";client.stop();}
+      http.end();if(code<0)client.stop();
+    }
+    httpJob54.elapsed=millis()-start;xSemaphoreGive(httpDone54);
+  }
+}
+void servicePulse57() {
+  serviceRelay56();reportPulse56();
+  if(manualActive54&&!relayBusy){manualActive54=false;if(lastManualId==activeManualID54&&manualResult=="started")manualResult="completed";activeManualID54="";lastHbMs=millis()-10000;}
+}
+void serviceLocal54() {
+  servicePulse57();
+  if(!relayBusy)checkAutoBell();
+}
+String httpRequest54(const String& method,const String& path,const String& body,int& code) {
+  code=-1;
+  // Keep the connection, but do not initiate a new TLS/HTTP operation mid-pulse.
+  if(relayBusy){code=-2;return "";}
+  if(!httpTask54||!isConnected()||getEpochSec()<1700000000)return "";
+  httpJob54.method=method;httpJob54.path=path;httpJob54.body=body;
+  uint8_t token=1;if(xQueueSend(httpQueue54,&token,0)!=pdTRUE)return "";
+  while(xSemaphoreTake(httpDone54,pdMS_TO_TICKS(20))!=pdTRUE)serviceLocal54();
+  // A scheduled bell may have started while this HTTP operation was in flight.
+  // Finish its pulse before the caller can write flash or change network/time.
+  while(relayBusy){servicePulse57();delay(10);}
+  code=httpJob54.code;lastHttpCode54=code;lastHttpMs54=httpJob54.elapsed;
+  if(code!=200&&code!=204)Serial.printf("[HTTP] %s %s status %d (%lu ms)\n",method.c_str(),path.c_str(),code,(unsigned long)lastHttpMs54);
+  return httpJob54.result;
+}
+String fbGet(const String& path) {
+  int code;String result=httpRequest54("GET",path,"",code);return code==200?result:"";
+}
+bool fbPut(const String& path,const String& body) {
+  int code;httpRequest54("PUT",path,body,code);return code==200||code==204;
+}
+bool fbDelete(const String& path) {
+  int code;httpRequest54("DELETE",path,"",code);return code==200||code==204;
+}
+
+// Accept seconds as a JSON integer or a legacy digit-only string.
+// Never silently substitute five seconds for a missing/malformed duration.
+bool readDuration55(JsonVariantConst value,int& seconds) {
+  seconds=0;
+  if(value.is<int>())seconds=value.as<int>();
+  else if(value.is<const char*>()) {
+    const char* p=value.as<const char*>();
+    if(!p||!*p)return false;
+    for(;*p;++p){if(*p<'0'||*p>'9')return false;seconds=seconds*10+(*p-'0');if(seconds>60)return false;}
+  }else return false;
+  return seconds>=1&&seconds<=60;
+}
+
+bool ringBell(int durationSec,const String& label,const String& requestID58) {
+  if(relayBusy){relayError54="Output busy";return false;}
+  if(!relayTimerReady56){relayError54="Cutoff timer unavailable; output kept OFF";return false;}
+  if(durationSec<1||durationSec>60){relayError54="Duration must be 1-60 whole seconds";return false;}
+  // Flush any previous completion before recording a new pulse.
+  reportPulse56();
+  if(!savePulseJournal58(durationSec,requestID58)) {
+    relayError54="Cannot save pulse receipt; output kept OFF";return false;
+  }
+  pulseJournalError58=false;
+  lastPulseStartEpochMs57=getEpochMillis57();
+  lastPulseEndEpochMs57=lastPulseStartEpochMs57+(uint64_t)durationSec*1000ULL;
+  // GPIO activation and deadline publication are one protected operation.
+  // Waiting for task scheduling before this point cannot consume the pulse.
+  portENTER_CRITICAL(&relayMux54);
+  gpio_set_level((gpio_num_t)RELAY_PIN,RELAY_ON);
+  relayStartedUs56=esp_timer_get_time();
+  relayDeadlineUs56=relayStartedUs56+(int64_t)durationSec*1000000LL;
+  activeDuration56=durationSec;relayBusy=true;
+  portEXIT_CRITICAL(&relayMux54);
+  lastRingDuration55=durationSec;relayError54="";
+  Serial.printf("[PULSE START] requested=%ds GPIO=%d level=%d label=%s\n",durationSec,RELAY_PIN,RELAY_ON,label.c_str());
+  return true;
+}
+
+
+bool isSunday()         { return getDOW() == 0; }
+bool isSecondSaturday() { int d = getDOM(); return getDOW() == 6 && d >= 8 && d <= 14; }
+
+bool isInRange(const String& today, const String& s, const String& e) {
+  return (today >= s && today <= e);
+}
+
+bool isHoliday(const String& today) {
+  if (isSunday()) return true;
+  if (isSecondSaturday()) return true;
+  for (int i = 0; i < holidayCount; i++)
+    if (holidays[i] == today) return true;
+  for (int i = 0; i < holidayRangeCount; i++)
+    if (isInRange(today, holidayRanges[i].start, holidayRanges[i].end)) return true;
+  return false;
+}
+
+bool isExamDay(const String& today) {
+  for (int i = 0; i < examDateCount; i++)
+    if (examDates[i] == today) return true;
+  return false;
+}
+
+
+void checkAutoBell() {
+  static uint32_t tick=0;if(millis()-tick<100)return;tick=millis();
+  String now=getTimeStr(),today=getDateStr();
+  if(now.length()!=5||today.length()!=10){autoStatus54="No valid clock: connect NTP or initialize DS3231";return;}
+  if(cachedMode=="manual_off"){autoStatus54="Automatic timetable disabled (Manual OFF mode)";return;}
+  if(relayBusy){autoStatus54="Output busy; schedule will be rechecked after cutoff";return;}
+  if(!relayTimerReady56){autoStatus54="Cutoff timer unavailable; output disabled";return;}
+  String slot=today+"_"+now;
+  if(bootSlot.length()!=16){bootSlot=slot;return;}
+  if(slot==bootSlot){autoStatus54="Startup/time-reset minute skipped; future events remain enabled";return;}
+  if(!guard::newSlot(slot.c_str(),lastSlot.c_str())){autoStatus54=slot<lastSlot?"Clock behind last event: waiting to avoid replay":"Scheduled event already handled this minute";return;}
+  bool exam=isExamDay(today)||cachedMode=="exam";
+  if(!exam&&isHoliday(today)){autoStatus54="Regular timetable paused: Sunday, second Saturday or configured holiday";return;}
+  int seconds=0;String label="";
+  if(exam) {
+    for(int i=0;i<examCount;i++)if(examBells[i].date==today&&examBells[i].time==now&&examBells[i].duration>seconds){seconds=examBells[i].duration;label=examBells[i].label;}
+  }else{
+    for(int i=0;i<regularCount;i++)if(regularPeriods[i].time==now&&regularPeriods[i].duration>seconds){seconds=regularPeriods[i].duration;label=regularPeriods[i].label;}
+  }
+  autoStatus54=exam?"Exam timetable active":"Regular timetable active";
+  if((exam?examCount:regularCount)==0)autoStatus54="No entries loaded for the active timetable";
+  if(seconds) {
+    if(!reserveMinute(slot)){autoStatus54="Cannot save duplicate guard; output kept OFF";return;}
+    if(ringBell(seconds,label)){lastEventId=slot+(exam?"|EXAM":"|REGULAR");autoStatus54="Scheduled ring started";}
+    else autoStatus54=relayError54;
+  }
+}
+
+
+
+
+
+
+
+
+
+void fetchWiFiConfig() {
+  if(!isConnected()||trialActive)return;
+  if(wifiResultDirty && fbPut("/status/wifiChange",wifiResultJSON))wifiResultDirty=false;
+  for(int index=0;index<2;index++) {
+    bool primary=index==0;
+    String raw=fbGet(primary?"/config/wifi_primary_pending":"/config/wifi_pending");
+    if(!raw.length()||raw=="null")continue;
+    StaticJsonDocument<1024> d;if(deserializeJson(d,raw))continue;
+    int version=d["version"]|0;
+    if(version<1||version<=(primary?primaryProcessed:secondaryProcessed))continue;
+    String ssid=d[primary?"ssid1":"ssid2"]|"",pass=d[primary?"pass1":"pass2"]|"";
+    if(ssid.length()<1||ssid.length()>32||pass.length()<8||pass.length()>63)continue;
+    uint64_t issued=d["issuedAt"]|0ULL,expires=d["expiresAt"]|0ULL,now=(uint64_t)getEpochSec()*1000ULL;
+    if(!guard::fresh(issued,expires,now))continue;
+    // Consume a request before trial, so a failed update is not retried endlessly.
+    if(!prefs.begin("smartbell",false))return;
+    bool saved=prefs.putInt(primary?"sb_pr52":"sb_sc52",version)==4;prefs.end();if(!saved)return;
+    if(primary)primaryProcessed=version;else secondaryProcessed=version;
+    candidateSSID=ssid;candidatePASS=pass;candidateVersion=version;pendingPrimary=primary;
+    oldWasPrimary=usingPrimary;hasPendingSecondary=true;trialActive=true;trialStart=millis();
+    StaticJsonDocument<384> r;r["target"]=primary?"primary":"secondary";r["version"]=version;r["ssid"]=ssid;r["state"]="testing";
+    wifiResultJSON="";serializeJson(r,wifiResultJSON);saveToNVS("sb_wifi52",wifiResultJSON);
+    fbPut("/status/wifiChange",wifiResultJSON);
+    WiFi.disconnect(false);WiFi.mode(WIFI_STA);WiFi.begin(ssid.c_str(),pass.c_str());trialStart=millis();enterWifiState(WS_TESTING_PENDING);
+    Serial.println("[WiFi] Testing "+String(primary?"primary: ":"secondary: ")+ssid);return;
+  }
+}
+
+
+void fetchTimeConfig() {
+  String raw=fbGet("/config/timeConfig");StaticJsonDocument<1024>d;if(deserializeJson(d,raw))return;
+  int version=d["syncVersion"]|0;
+  if(version<1||version<=loadFromNVS_int("sb_time52",0)||version<=(d["processedVersion"]|0))return;
+  uint64_t issued=d["issuedAt"]|0ULL,expires=d["expiresAt"]|0ULL,now=(uint64_t)getEpochSec()*1000ULL;
+  if(!guard::fresh(issued,expires,now))return;
+  if(!rtcAvailable)return;
+  if(d["useNTP"]|false) {
+    if(ntpGeneration.load()==0)return;
+    lastRtcNtpSyncMs=0;ntpAppliedGeneration=0;syncNTPandRTC();if(!rtcValid)return;
+  }else{
+    int y=d["year"]|0,mo=d["month"]|0,day=d["day"]|0,h=d["hour"]|0,m=d["minute"]|0,sec=d["second"]|0;
+    if(y<2024||y>2035||mo<1||mo>12||day<1||day>31||h<0||h>23||m<0||m>59||sec<0||sec>59)return;
+    DateTime dt(y,mo,day,h,m,sec);if(!dt.isValid())return;
+    // The entered time is the time at submission, not the later poll time.
+    dt=dt+TimeSpan((int32_t)(now>issued?(now-issued)/1000ULL:0));
+    setRTCManual(dt.year(),dt.month(),dt.day(),dt.hour(),dt.minute(),dt.second());bootSlot=getDateStr()+"_"+getTimeStr();
+    timeval tv{(time_t)dt.unixtime()-UTC_OFFSET_SEC,0};settimeofday(&tv,nullptr);
+    lastRtcNtpSyncMs=millis();
+  }
+  saveToNVS("sb_time52",version);
+  // Acknowledge only these fields; never replace a newer incoming request.
+  fbPut("/config/timeConfig/processedVersion",String(version));
+  StaticJsonDocument<128> stamp;stamp.set(getDateTimeStr());String body;serializeJson(stamp,body);
+  fbPut("/config/timeConfig/processedAt",body);
+}
+
+
+void checkCommand() {
+  String payload=fbGet("/commands/current");lastCommandPoll54=millis();
+  if(!payload.length()||payload=="null")return;
+  StaticJsonDocument<768> d;if(deserializeJson(d,payload)||!(d["ring"]|false))return;
+  String id=d["id"]|"";uint64_t issued=d["updatedAt"]|0ULL,expires=d["expiresAt"]|0ULL,now=(uint64_t)getEpochSec()*1000ULL;
+  if(!guard::newCommand(id.c_str(),lastManualId.c_str(),issued,lastManualIssued))return;
+  int seconds=0;bool validDuration=readDuration55(d["duration"],seconds);
+  if(issued<1700000000000ULL||issued>now+30000ULL)return;
+  if(!prefs.begin("smartbell",false))return;
+  bool ok=prefs.putString("sb_cmd52",id)==id.length() && prefs.putULong64("sb_cmdAt52",issued)==8;
+  prefs.end();if(!ok)return;lastManualId=id;lastManualIssued=issued;
+  manualDuration55=validDuration?seconds:0;manualPulseMs58=0;
+  manualLatency54=now>issued?now-issued:0;
+  if(!guard::fresh(issued,expires,now)||manualLatency54>15000ULL)manualResult="expired";
+  else if(!validDuration)manualResult="invalid_duration";
+  // Commands submitted during a pulse are rejected, not run later as a queue.
+  else if(relayBusy||(issued>=lastPulseStartEpochMs57&&issued<lastPulseEndEpochMs57))manualResult="busy";
+  else if(ringBell(seconds,"Manual",id)){
+    lastEventId=getDateStr()+"_"+getTimeStr()+"|MANUAL|"+id;manualResult="started";manualActive54=true;activeManualID54=id;
+  }else manualResult="timer_error";
+  lastHbMs=millis()-10000;
+  if(relayBusy)return; // completion is acknowledged by heartbeat after cutoff
+  StaticJsonDocument<384> r;r["id"]=id;r["state"]=manualResult;r["latencyMs"]=manualLatency54;r["duration"]=manualDuration55;r["at"][".sv"]="timestamp";
+  String raw;serializeJson(r,raw);fbPut("/status/manualCommand",raw);lastHbMs=millis()-10000;
+}
+
+
+void checkRestartCommand() {
+  if(relayBusy||trialActive)return;
+  String raw=fbGet("/config/restart");
+  // A scheduled pulse may have started inside fbGet's local-service loop.
+  // Defer without consuming the restart ID, then retry when the pulse finishes.
+  if(relayBusy||trialActive)return;
+  StaticJsonDocument<512>d;if(deserializeJson(d,raw))return;
+  String id=d["id"]|"";if(id.length()<8||id==lastRestartId||!(d["restart"]|false))return;
+  if(!guard::fresh(d["issuedAt"]|0ULL,d["expiresAt"]|0ULL,(uint64_t)getEpochSec()*1000ULL))return;
+  if(!prefs.begin("smartbell",false))return;
+  bool ok=prefs.putString("sb_rst52",id)==id.length();prefs.end();if(!ok)return;
+  digitalWrite(RELAY_PIN,RELAY_OFF);ESP.restart();
+}
+
+
+
+
+
+void sendHeartbeat() {
+  if(!isConnected())return;
+  StaticJsonDocument<3072>d;d["heartbeat"][".sv"]="timestamp";d["firmware"]="5.4";d["build"]="5.4.6-fs-recovery";d["durationProtocol"]=1;d["lastRingDuration"]=lastRingDuration55;
+  uint32_t measured,sequence;int requested;
+  portENTER_CRITICAL(&relayMux54);
+  measured=completedPulseMs56;sequence=pulseSequence56;requested=completedDuration56;
+  portEXIT_CRITICAL(&relayMux54);
+  d["previousPulseUnconfirmed"]=previousPulseUnconfirmed58;d["previousPulseSec"]=previousPulseSec58;
+  d["pulseJournalError"]=pulseJournalError58;
+  d["lastPulseMs"]=measured;d["lastPulseRequestedSec"]=requested;d["pulseCount"]=sequence;d["uptimeMs"]=millis();
+  d["wifiMode"]=usingPrimary?"PRIMARY":"SECONDARY";d["wifiState"]=wifiStateName(wifiSM);
+  d["ssid"]=WiFi.SSID();d["primarySSID"]=dynSSID1;d["secondarySSID"]=dynSSID2;
+  d["ip"]=WiFi.localIP().toString();d["rssi"]=WiFi.RSSI();d["offline"]=false;
+  refreshClock54();d["rtcPresent"]=rtcAvailable;d["rtcOK"]=rtcValid;d["rtcTime"]=getDateTimeStr();d["timeSource"]=rtcAvailable&&rtcValid?"DS3231":(clockUsable54?"System clock / NTP":"NONE");
+  d["schedVer"]=scheduleVersion;d["lastSchedSync"]=(uint64_t)(lastSchedSyncMs?getEpochSec()-(millis()-lastSchedSyncMs)/1000:0);
+  d["lastNTPVerify"]=(uint64_t)(lastRtcNtpSyncMs?getEpochSec()-(millis()-lastRtcNtpSyncMs)/1000:0);
+  d["mode"]=cachedMode;d["lastBell"]=lastEventId;d["pendingWifi"]=trialActive;d["ringing"]=relayBusy.load();
+  d["manualCommand"]["id"]=lastManualId;d["manualCommand"]["state"]=manualResult;
+  d["manualCommand"]["pulseMs"]=manualPulseMs58;
+  d["manualCommand"]["latencyMs"]=manualLatency54;d["manualCommand"]["duration"]=manualDuration55;
+  d["regularCount"]=regularCount;d["examCount"]=examCount;d["scheduleCached"]=scheduleCached54;
+  d["autoStatus"]=autoStatus54;d["relayError"]=relayError54;d["lastHttpMs"]=lastHttpMs54;d["lastHttpCode"]=lastHttpCode54;
+  d["scheduleError"]=scheduleError;d["resetReason"]=(int)esp_reset_reason();
+  if(wifiResultJSON.length()){StaticJsonDocument<512>r;if(!deserializeJson(r,wifiResultJSON))d["wifiChange"]=r.as<JsonObject>();}
+  String body;serializeJson(d,body);fbPut("/status",body);
+}
+
+
+void setup() {
+  digitalWrite(RELAY_PIN,RELAY_OFF);pinMode(RELAY_PIN,OUTPUT);digitalWrite(RELAY_PIN,RELAY_OFF);
+  Serial.begin(115200);Serial.printf("[BOOT] SmartBell 5.4.6 relay timing reset reason=%d; no startup pulse\n",(int)esp_reset_reason());
+  esp_timer_create_args_t args{};args.callback=relayTick56;args.name="bell-deadline";
+  args.skip_unhandled_events=true;
+  if(esp_timer_create(&args,&relayTimer)==ESP_OK) {
+    relayTimerReady56=esp_timer_start_periodic(relayTimer,10000ULL)==ESP_OK;
+  }
+  if(!relayTimerReady56)Serial.println("[PULSE ERROR] Timer initialization failed; relay remains OFF");
+  fsAvailable=initFS();rtcAvailable=initRTC();
+  if(rtcAvailable&&rtcValid){timeval tv{(time_t)rtc.now().unixtime()-UTC_OFFSET_SEC,0};settimeofday(&tv,nullptr);}
+  if(fsAvailable)loadScheduleFromFS();
+  loadWiFiFromNVS();loadLastBellKey();restorePulseJournal58();
+  httpQueue54=xQueueCreate(1,sizeof(uint8_t));httpDone54=xSemaphoreCreateBinary();
+  if(httpQueue54&&httpDone54&&xTaskCreate(httpWorker54,"firebase-io",12288,nullptr,1,&httpTask54)!=pdPASS)httpTask54=nullptr;
+  if(!httpTask54)Serial.println("[HTTP] Worker unavailable; cached timetable remains active");
+  WiFi.persistent(false);WiFi.setAutoReconnect(false);
+  sntp_set_time_sync_notification_cb([](struct timeval*){++ntpGeneration;});
+  configTime(UTC_OFFSET_SEC,DST_OFFSET_SEC,NTP_SERVER,"time.google.com");
+  lastSyncMs=millis()-SYNC_MS;lastHbMs=millis()-HB_MS;lastWifiPoll=millis()-2000;
+  enterWifiState(WS_INIT);
+}
+
+
+void loop() {
+  serviceLocal54();
+  // During a pulse, only service its deadline. Existing Wi-Fi stays connected.
+  // Brownout and watchdog protections remain enabled.
+  if(relayBusy){delay(10);return;}
+  wifiStateMachine();
+  if(!relayBusy)syncNTPandRTC();
+  if(trialActive)testAndCommitPendingSecondary();
+  if(isConnected()&&!trialActive) {
+    uint32_t now=millis();
+    // Exactly one background operation per pass; commands have priority between them.
+    if(now-lastPollMs>=POLL_MS){checkCommand();lastPollMs=millis();}
+    else {
+      static uint8_t background=0;static uint32_t timePoll=0,restartPoll=0;
+      // Round-robin prevents a slow heartbeat from starving schedule synchronization.
+      for(int scan=0;scan<5;scan++) {
+        uint8_t job=background;background=(background+1)%5;
+        if(job==0&&now-lastHbMs>=5000){sendHeartbeat();lastHbMs=millis();break;}
+        if(relayBusy)continue;
+        if(job==1&&now-lastSyncMs>=SYNC_MS){fetchAllSchedule();lastSyncMs=millis();break;}
+        if(job==2&&now-lastWifiPoll>=15000){fetchWiFiConfig();lastWifiPoll=millis();break;}
+        if(job==3&&now-timePoll>=15000){fetchTimeConfig();timePoll=millis();break;}
+        if(job==4&&now-restartPoll>=30000){checkRestartCommand();restartPoll=millis();break;}
+      }
+    }
+  }
+  static String command;
+  while(Serial.available()) {char c=Serial.read();if(c=='\n') {
+    command.trim();
+    if(command.startsWith("TEST ")) {
+      // Local diagnostic: same relay path, independent of Wi-Fi and timetable.
+      String text=command.substring(5);text.trim();bool digits=text.length()>0&&text.length()<=2;
+      for(size_t i=0;i<text.length();++i)if(text[i]<'0'||text[i]>'9')digits=false;
+      int seconds=digits?text.toInt():0;
+      if(seconds<1||seconds>60)Serial.println("Use TEST 5 or TEST 10 (1-60 whole seconds)");
+      else if(!ringBell(seconds,"Serial test"))Serial.println(relayError54);
+    }
+    if(command=="FORMAT"&&!fsAvailable&&!relayBusy){fsAvailable=LittleFS.format()&&LittleFS.begin(false);lastSyncMs=millis()-SYNC_MS;Serial.println(fsAvailable?"Filesystem ready":"Format failed");}
+    command="";
+  }else if(command.length()<40)command+=c;}
+  delay(20);
+}
+
+bool validTime52(const String& t) {
+  if(t.length()!=5||t[2]!=':')return false;
+  for(int i=0;i<5;i++)if(i!=2&&(t[i]<'0'||t[i]>'9'))return false;
+  return t.substring(0,2).toInt()<24&&t.substring(3,5).toInt()<60;
+}
+bool validDate52(const String& t) {
+  if(t.length()!=10||t[4]!='-'||t[7]!='-')return false;
+  for(int i=0;i<10;i++)if(i!=4&&i!=7&&(t[i]<'0'||t[i]>'9'))return false;
+  int y=t.substring(0,4).toInt(),m=t.substring(5,7).toInt(),d=t.substring(8,10).toInt();
+  return y>=2024&&y<=2099&&m>=1&&m<=12&&d>=1&&d<=31&&DateTime(y,m,d,0,0,0).isValid();
+}
+bool applySnapshot52(JsonVariantConst d,bool apply) {
+  if(!d.is<JsonObjectConst>())return false;
+  String mode=d["config"]["mode"]["mode"]|"";
+  if(mode!="regular"&&mode!="exam"&&mode!="manual_off")return false;
+  const char* paths[]={"regularPeriods","examSchedule","holidays","holidayRanges","examDates"};
+  int limits[]={MAX_PERIODS,MAX_EXAM,MAX_HOLIDAYS,MAX_HOL_RANGES,MAX_EXAM_DATES};
+  for(int k=0;k<5;k++){
+    auto rows=d[paths[k]];
+    if(!rows.isNull()&&!rows.is<JsonObjectConst>())return false;
+    if(rows.size()>(size_t)limits[k])return false;
+    for(JsonPairConst kv:rows.as<JsonObjectConst>()){
+      auto r=kv.value();if(!r.is<JsonObjectConst>())return false;
+      if(k<2){
+        if(!r["time"].is<const char*>()||!validTime52(r["time"].as<String>()))return false;
+        int dur=0;if(!readDuration55(r["duration"],dur))return false;
+        if(!r["label"].is<const char*>()||r["label"].as<String>().length()>96)return false;
+      }
+      if(k==1||k==2||k==4)if(!r["date"].is<const char*>()||!validDate52(r["date"].as<String>()))return false;
+      if(k==3){String a=r["start"]|"",b=r["end"]|"";if(!validDate52(a)||!validDate52(b)||a>b)return false;}
+    }
+  }
+  if(!d["scheduleVersion"].isNull()&&!d["scheduleVersion"].is<int>())return false;
+  if(!apply)return true;
+  // Validation completes before any live array is changed. No partial downloads.
+  regularCount=examCount=holidayCount=holidayRangeCount=examDateCount=0;
+  for(JsonPairConst kv:d["regularPeriods"].as<JsonObjectConst>()){auto r=kv.value();auto& p=regularPeriods[regularCount++];p.time=r["time"].as<String>();readDuration55(r["duration"],p.duration);p.label=r["label"].as<String>();}
+  for(JsonPairConst kv:d["examSchedule"].as<JsonObjectConst>()){auto r=kv.value();auto& p=examBells[examCount++];p.date=r["date"].as<String>();p.time=r["time"].as<String>();readDuration55(r["duration"],p.duration);p.label=r["label"].as<String>();}
+  for(JsonPairConst kv:d["holidays"].as<JsonObjectConst>())holidays[holidayCount++]=kv.value()["date"].as<String>();
+  for(JsonPairConst kv:d["examDates"].as<JsonObjectConst>())examDates[examDateCount++]=kv.value()["date"].as<String>();
+  for(JsonPairConst kv:d["holidayRanges"].as<JsonObjectConst>()){auto r=kv.value();auto& p=holidayRanges[holidayRangeCount++];p.start=r["start"].as<String>();p.end=r["end"].as<String>();p.label=r["label"]|"Holiday";}
+  cachedMode=mode;scheduleVersion=d["scheduleVersion"]|0;cachedSchedVersion=scheduleVersion;return true;
+}
+uint32_t cacheHash52(const String& s) {uint32_t h=2166136261u;for(size_t i=0;i<s.length();i++)h=(h^(uint8_t)s[i])*16777619u;return h;}
+String cachePath52(int slot){return slot?"/sb52b.cache":"/sb52a.cache";}
+bool readCache52(int slot,String& raw,uint32_t& seq) {
+  File f=LittleFS.open(cachePath52(slot),"r");if(!f||f.size()>50000)return false;
+  String head=f.readStringUntil('\n');unsigned long generation=0,hash=0,len=0;
+  if(sscanf(head.c_str(),"%lu %lu %lu",&generation,&hash,&len)!=3||len>45000){f.close();return false;}
+  raw=f.readString();f.close();if(!generation||raw.length()!=len||cacheHash52(raw)!=hash)return false;
+  DynamicJsonDocument d(32768);if(deserializeJson(d,raw)||!applySnapshot52(d.as<JsonVariantConst>(),false))return false;
+  seq=generation;return true;
+}
+bool writeCache52(const String& raw) {
+  if(!fsAvailable)return false;
+  uint32_t next=cacheSequence+1;File f=LittleFS.open(cachePath52(next%2),"w");if(!f){Serial.println("[Cache] Save FAILED: cannot open cache file");return false;}
+  f.printf("%lu %lu %lu\n",(unsigned long)next,(unsigned long)cacheHash52(raw),(unsigned long)raw.length());
+  size_t n=f.print(raw);f.flush();f.close();String check;uint32_t seq=0;
+  if(n!=raw.length()||!readCache52(next%2,check,seq)||seq!=next){Serial.println("[Cache] Save FAILED: read-back validation failed");return false;}
+  cacheSequence=next;return true;
+}
+bool loadScheduleFromFS() {
+  String best;
+  for(int slot=0;slot<2;slot++){String raw;uint32_t seq=0;if(readCache52(slot,raw,seq)&&seq>cacheSequence){best=raw;cacheSequence=seq;}}
+  if(best.length()){
+    DynamicJsonDocument d(32768);if(deserializeJson(d,best))return false;
+    if(applySnapshot52(d.as<JsonVariantConst>(),true)){scheduleBody=best;scheduleCached54=true;Serial.printf("[Cache] Restored saved timetable snapshot (sequence %lu)\n",(unsigned long)cacheSequence);return true;}
+  }
+  // Preserve old cache file for rollback; first online fetch populates the new format.
+  Serial.println("[Cache] No valid saved snapshot yet; connect once to download timetable");return false;
+}
+void fetchAllSchedule() {
+  String raw=fbGet("/");if(!raw.length()){scheduleError="Download failed; kept previous timetable";return;}
+  StaticJsonDocument<512> filter;
+  const char* paths[]={"regularPeriods","examSchedule","holidays","holidayRanges","examDates","scheduleVersion"};
+  for(auto p:paths)filter[p]=true;filter["config"]["mode"]=true;
+  DynamicJsonDocument d(32768);
+  if(deserializeJson(d,raw,DeserializationOption::Filter(filter))||!applySnapshot52(d.as<JsonVariantConst>(),false)){
+    scheduleError="Invalid timetable: check times, durations, dates, mode and row limits";return;
+  }
+  String body;serializeJson(d,body);
+  if(body!=scheduleBody) {
+    // A flash failure must not disable an otherwise valid online timetable.
+    scheduleCached54=writeCache52(body);
+    applySnapshot52(d.as<JsonVariantConst>(),true);scheduleBody=body;
+    Serial.printf("[Schedule] regular=%d exam=%d mode=%s cache=%s\n",regularCount,examCount,cachedMode.c_str(),scheduleCached54?"saved":"RAM only");
+  }else if(!scheduleCached54&&fsAvailable) scheduleCached54=writeCache52(body);
+  lastSchedSyncMs=millis();scheduleError=scheduleCached54?"":"Timetable active in RAM; offline restart needs a working cache";
+}
