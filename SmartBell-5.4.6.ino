@@ -741,8 +741,8 @@ const String FB_HOST = "https://smart-bell-b2fc0-default-rtdb.asia-southeast1.fi
 
 
 #define RELAY_PIN   26     // GPIO → Relay IN1 (unchanged)
-#define RELAY_ON    LOW    // Active-LOW relay: LOW = bell ON
-#define RELAY_OFF   HIGH   // HIGH = bell OFF
+#define RELAY_ON    HIGH    // Active-LOW relay: LOW = bell ON
+#define RELAY_OFF   LOW   // HIGH = bell OFF
 
 #define RTC_SDA     21
 #define RTC_SCL     22
